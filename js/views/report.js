@@ -22,8 +22,10 @@ let _comparison = null;
 let _smCanvas = null;
 let _smCtx = null;
 let _smDpr = 1;
-let _smLayout = null;   // { panelW, panelH, originX, originY, rows, cols, nSubs }
+let _hmBaseImage = null; // cached base heatmap for overlay efficiency
+let _hmPad = { l: 40, r: 14, t: 14, b: 6 };
 let _subHorizons = null; // Float32Array(360)[]
+let _allPaths = null;    // precomputed sun paths
 
 export function render(container) {
   _container = container;
@@ -210,48 +212,50 @@ function buildReport() {
         </div>
       </div>
 
-      <!-- Interactive shade map -->
+      <!-- Sky visibility heatmap -->
       <div class="card">
-        <div class="card-header">
-          <h2>Shade Map — Time Simulator</h2>
-          <div id="sm-status" style="font-size:12px;font-family:'JetBrains Mono',monospace;color:var(--text2)"></div>
+        <h2>Sky Visibility Map</h2>
+        <div class="hint" style="margin-bottom:8px;margin-top:-4px">
+          Fraction of sub-panels with clear view to each sky position. Blue = visible, brown = blocked.
         </div>
+        ${getAllScenarios().length > 1 ? `
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+          <label style="font-size:11px;color:var(--text2)">Shade scenario:</label>
+          <select id="sm-scenario" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-sm);padding:4px 10px;font-size:12px">
+            ${getAllScenarios().map(s => `<option value="${esc(s)}" ${s === state.activeScenario ? 'selected' : ''}>${esc(s)}</option>`).join('')}
+          </select>
+        </div>` : ''}
         <div id="shade-map-wrap" style="position:relative;width:100%;background:var(--surface2);border-radius:var(--radius-sm);overflow:hidden">
-          <canvas id="c-shade-map" style="display:block;width:100%"></canvas>
+          <canvas id="c-shade-map" width="680" height="240" style="display:block;width:100%"></canvas>
         </div>
-        <div style="display:flex;gap:24px;align-items:center;flex-wrap:wrap;margin-top:12px">
-          <div style="flex:1;min-width:200px">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
-              <label style="font-size:11px;color:var(--text2)">Date</label>
-              <span id="sm-date-label" style="font-size:12px;font-family:'JetBrains Mono',monospace;color:var(--sun)"></span>
-            </div>
-            <input type="range" id="sm-doy" min="1" max="365" value="172" style="width:100%">
-          </div>
-          <div style="flex:1;min-width:200px">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
-              <label style="font-size:11px;color:var(--text2)">Time</label>
-              <span id="sm-time-label" style="font-size:12px;font-family:'JetBrains Mono',monospace;color:var(--sun)"></span>
-            </div>
-            <input type="range" id="sm-hour" min="-105" max="105" value="0" step="1" style="width:100%">
-          </div>
-          <div style="text-align:center;min-width:100px">
-            <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.4px">Shaded</div>
-            <div id="sm-shaded-count" style="font-size:18px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--loss)"></div>
-          </div>
+        <div style="display:flex;justify-content:space-between;margin-top:4px">
+          <span class="legend-label">E (90°)</span><span class="legend-label">SE</span><span class="legend-label">S (180°)</span><span class="legend-label">SW</span><span class="legend-label">W (270°)</span>
         </div>
-        <div class="legend-row" style="justify-content:center;gap:16px;margin-top:10px">
-          <span class="legend-label" style="display:flex;align-items:center;gap:4px">
-            <span style="width:12px;height:12px;border-radius:2px;background:#22c55e;display:inline-block"></span> Full sun
-          </span>
-          <span class="legend-label" style="display:flex;align-items:center;gap:4px">
-            <span style="width:12px;height:12px;border-radius:2px;background:#f5a623;display:inline-block"></span> Partial shade
-          </span>
-          <span class="legend-label" style="display:flex;align-items:center;gap:4px">
-            <span style="width:12px;height:12px;border-radius:2px;background:#ef4444;display:inline-block"></span> Full shade
-          </span>
-          <span class="legend-label" style="display:flex;align-items:center;gap:4px">
-            <span style="width:12px;height:12px;border-radius:2px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);display:inline-block"></span> Night
-          </span>
+        <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+            <h3 style="margin:0;font-size:14px">Time Simulator</h3>
+            <span id="sm-status" style="font-size:12px;font-family:'JetBrains Mono',monospace;color:var(--sun)">drag sliders</span>
+          </div>
+          <div style="display:flex;gap:16px;align-items:start;flex-wrap:wrap">
+            <div style="flex:1;min-width:180px">
+              <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+                <span style="font-size:10px;color:var(--text2)">Date</span>
+                <span id="sm-date-label" style="font-size:12px;font-family:'JetBrains Mono',monospace;color:var(--sun)">Jun 21</span>
+              </div>
+              <input type="range" id="sm-doy" min="1" max="365" value="172" style="width:100%;accent-color:var(--sun)">
+            </div>
+            <div style="flex:1;min-width:180px">
+              <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+                <span style="font-size:10px;color:var(--text2)">Time</span>
+                <span id="sm-time-label" style="font-size:12px;font-family:'JetBrains Mono',monospace;color:var(--sun)">12:00pm</span>
+              </div>
+              <input type="range" id="sm-hour" min="-90" max="90" value="0" step="1" style="width:100%;accent-color:var(--sun)">
+            </div>
+            <div style="min-width:100px;padding:6px 10px;background:var(--surface2);border-radius:8px;text-align:center">
+              <div style="font-size:9px;color:var(--text2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:1px">Shaded</div>
+              <div id="sm-shaded-count" style="font-size:18px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--loss)">&mdash;</div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -315,8 +319,16 @@ function bindReportEvents() {
     buildHourlyTable(parseInt(e.target.value));
   });
 
-  qs('#sm-doy', _container)?.addEventListener('input', updateShadeMap);
-  qs('#sm-hour', _container)?.addEventListener('input', updateShadeMap);
+  qs('#sm-doy', _container)?.addEventListener('input', updateSimOverlay);
+  qs('#sm-hour', _container)?.addEventListener('input', updateSimOverlay);
+
+  // Shade map scenario dropdown
+  qs('#sm-scenario', _container)?.addEventListener('change', (e) => {
+    const scn = e.target.value;
+    const subPanels = _results.subPanels;
+    _subHorizons = subPanels.map(sp => getMergedHorizon(sp.ptIds, scn));
+    drawHeatmapBase();
+  });
 }
 
 // --- Panel heatmap ---
@@ -581,70 +593,197 @@ function buildPanelDetailTable() {
 
 // --- Helpers ---
 
-// ─── Interactive Shade Map ────────────────────────────
+// ─── Sky Visibility Heatmap ───────────────────────────
 
 function initShadeMap() {
   _smCanvas = qs('#c-shade-map', _container);
   if (!_smCanvas || !_results) return;
   _smCtx = _smCanvas.getContext('2d');
-  _smDpr = window.devicePixelRatio || 1;
 
   const state = getState();
-  const { rows, cols } = state.system;
   const subPanels = _results.subPanels;
-  const nSubs = subPanels.length > 0 ? subPanels[0].nSubs : 2;
+  const scn = state.activeScenario;
 
   // Pre-compute merged horizons for all sub-panels
-  const scn = state.activeScenario;
   _subHorizons = subPanels.map(sp => getMergedHorizon(sp.ptIds, scn));
 
-  computeShadeMapLayout();
-  updateShadeMap();
+  // Pre-compute sun paths
+  const lat = state.location.lat;
+  _allPaths = lat != null ? computeAllSunPaths(lat) : [];
 
-  // Observe resize
-  new ResizeObserver(() => {
-    computeShadeMapLayout();
-    updateShadeMap();
-  }).observe(_smCanvas.parentElement);
+  drawHeatmapBase();
 }
 
-function computeShadeMapLayout() {
-  if (!_smCanvas) return;
+/**
+ * Compute sky visibility: for each (azimuth, elevation) pixel,
+ * what fraction of sub-panels have a clear view?
+ */
+function computeVisibility() {
+  const azMin = 60, azMax = 300, elMax = 80;
+  const W = azMax - azMin, H = elMax;
+  const vis = new Float32Array(W * H);
+  const n = _subHorizons.length;
+  if (n === 0) return { vis, W, H, azMin, azMax, elMax };
+
+  for (let by = 0; by < H; by++) {
+    const elv = by + 0.5;
+    for (let bx = 0; bx < W; bx++) {
+      const az = azMin + bx;
+      let v = 0;
+      for (const h of _subHorizons) {
+        if (elv > h[az % 360]) v++;
+      }
+      vis[by * W + bx] = v / n;
+    }
+  }
+  return { vis, W, H, azMin, azMax, elMax };
+}
+
+/**
+ * Draw the full base heatmap: visibility pixels, horizon outlines,
+ * sun paths with hour labels, elevation labels, and legend.
+ * Caches result as _hmBaseImage for efficient overlay updates.
+ */
+function drawHeatmapBase() {
+  if (!_smCtx || !_smCanvas) return;
+
+  const { vis, W: cW, H: cH, azMin, azMax, elMax } = computeVisibility();
+  const can = _smCanvas;
+  const ctx = _smCtx;
+  const W = can.width, H = can.height;
+  const pad = _hmPad;
+  const dw = W - pad.l - pad.r;
+  const dh = H - pad.t - pad.b;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Draw pixel-level visibility
+  const tmp = document.createElement('canvas');
+  tmp.width = cW; tmp.height = cH;
+  const tc = tmp.getContext('2d');
+  const id = tc.createImageData(cW, cH);
+  for (let by = 0; by < cH; by++) {
+    for (let bx = 0; bx < cW; bx++) {
+      const v = vis[by * cW + bx];
+      const py = cH - 1 - by;
+      const i = (py * cW + bx) * 4;
+      id.data[i]     = Math.round(60 + v * 50);   // R: 60–110
+      id.data[i + 1] = Math.round(40 + v * 140);  // G: 40–180
+      id.data[i + 2] = Math.round(25 + v * 205);  // B: 25–230
+      id.data[i + 3] = 255;
+    }
+  }
+  tc.putImageData(id, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(tmp, pad.l, pad.t, dw, dh);
+
+  // Horizon outlines (all points, faint)
   const state = getState();
-  const { rows, cols, panelWidth, panelHeight, diodeSplit, diodeSubsections } = state.system;
-  const nSubs = diodeSubsections || 2;
-  const wrap = _smCanvas.parentElement;
-  const wrapW = wrap.clientWidth;
-
-  const SM_PAD = 30;
-  const SM_GAP = 4;
-  const aspect = panelHeight / panelWidth;
-  const availW = wrapW - 2 * SM_PAD - (cols - 1) * SM_GAP;
-  let pW = Math.max(28, availW / cols);
-  let pH = pW * aspect;
-
-  const gridH = rows * pH + (rows - 1) * SM_GAP;
-  if (gridH > 400) {
-    const s = 400 / gridH;
-    pW *= s;
-    pH *= s;
+  const pts = Object.values(state.points);
+  const scn = state.activeScenario;
+  for (const pt of pts) {
+    const h = getMergedHorizon([pt.id], scn);
+    ctx.beginPath();
+    for (let az = azMin; az < azMax; az++) {
+      const x = pad.l + ((az - azMin) / (azMax - azMin)) * dw;
+      const y = pad.t + dh * (1 - h[az] / elMax);
+      az === azMin ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+    ctx.lineWidth = 0.6;
+    ctx.stroke();
   }
 
-  const totalW = cols * pW + (cols - 1) * SM_GAP;
-  const originX = (wrapW - totalW) / 2;
-  const originY = SM_PAD;
-  const canvasH = originY + rows * pH + (rows - 1) * SM_GAP + SM_PAD;
+  // Sun paths
+  const lat = state.location.lat;
+  if (lat != null && _allPaths) {
+    const kp = [
+      { m: 5,  label: 'Jun solstice',  color: '#f5c842', dash: [] },
+      { m: 2,  label: 'Equinox',       color: '#e0e0e0', dash: [4, 3] },
+      { m: 11, label: 'Dec solstice',   color: '#f09050', dash: [] }
+    ];
+    const toX = az => pad.l + ((az - azMin) / (azMax - azMin)) * dw;
+    const toY = el => pad.t + dh * (1 - el / elMax);
 
-  _smCanvas.width = Math.round(wrapW * _smDpr);
-  _smCanvas.height = Math.round(canvasH * _smDpr);
-  _smCanvas.style.height = canvasH + 'px';
-  _smCtx.setTransform(_smDpr, 0, 0, _smDpr, 0, 0);
+    for (const k of kp) {
+      const path = _allPaths[k.m];
+      if (!path || path.length < 2) continue;
 
-  _smLayout = { panelW: pW, panelH: pH, originX, originY, rows, cols, nSubs, gap: SM_GAP, diodeSplit };
+      ctx.beginPath();
+      ctx.setLineDash(k.dash);
+      let started = false;
+      for (const pt of path) {
+        if (pt.azimuth < azMin || pt.azimuth > azMax) continue;
+        if (started) ctx.lineTo(toX(pt.azimuth), toY(pt.elevation));
+        else { ctx.moveTo(toX(pt.azimuth), toY(pt.elevation)); started = true; }
+      }
+      ctx.strokeStyle = k.color;
+      ctx.lineWidth = 1.8;
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Hour dots & labels
+      const doy = MDAYS_CUM[k.m] + 21;
+      for (let ha = -75; ha <= 75; ha += 15) {
+        const d = solarDeclination(doy);
+        const sp = sunPosition(lat, d, ha);
+        if (sp.elevation <= 1 || sp.azimuth < azMin + 5 || sp.azimuth > azMax - 5) continue;
+        ctx.beginPath();
+        ctx.arc(toX(sp.azimuth), toY(sp.elevation), 2.5, 0, Math.PI * 2);
+        ctx.fillStyle = k.color;
+        ctx.fill();
+        if (ha % 30 === 0) {
+          const hr = 12 + ha / 15;
+          const h12 = hr > 12 ? hr - 12 : hr;
+          const ap = hr >= 12 ? 'p' : 'a';
+          ctx.fillStyle = k.color;
+          ctx.font = '500 9px "JetBrains Mono", monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText(h12 + ap, toX(sp.azimuth), toY(sp.elevation) + (k.m === 5 ? -7 : 10));
+        }
+      }
+    }
+
+    // Legend (sun path key)
+    let ly = pad.t + 8;
+    for (const k of kp) {
+      ctx.beginPath();
+      ctx.setLineDash(k.dash);
+      ctx.moveTo(W - pad.r - 130, ly);
+      ctx.lineTo(W - pad.r - 112, ly);
+      ctx.strokeStyle = k.color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = k.color;
+      ctx.font = '9px "DM Sans", sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText(k.label, W - pad.r - 107, ly + 3);
+      ly += 14;
+    }
+  }
+
+  // Elevation Y-axis labels
+  ctx.fillStyle = '#8a92a4';
+  ctx.font = '10px "JetBrains Mono", monospace';
+  ctx.textAlign = 'right';
+  for (let el = 0; el <= elMax; el += 10) {
+    ctx.fillText(el + '\u00B0', pad.l - 4, pad.t + dh * (1 - el / elMax) + 3);
+  }
+
+  // Cache base image for efficient slider overlay
+  _hmBaseImage = new Image();
+  _hmBaseImage.src = can.toDataURL();
+  _hmBaseImage.onload = () => updateSimOverlay();
 }
 
-function updateShadeMap() {
-  if (!_smCtx || !_smLayout || !_results) return;
+/**
+ * Draw sun position overlay on cached base heatmap.
+ * Called on slider input.
+ */
+function updateSimOverlay() {
+  if (!_smCtx || !_smCanvas) return;
+
   const state = getState();
   const lat = state.location.lat;
   if (lat == null) return;
@@ -665,171 +804,83 @@ function updateShadeMap() {
   if (dateEl) dateEl.textContent = doyToStr(doy);
   if (timeEl) timeEl.textContent = haToStr(ha);
 
-  // Compute sun position
   const decl = solarDeclination(doy);
-  const sun = sunPosition(lat, decl, ha);
+  const sp = sunPosition(lat, decl, ha);
 
-  const isNight = sun.elevation <= 0;
+  if (sp.elevation <= 0) {
+    if (statusEl) { statusEl.textContent = 'Sun below horizon'; statusEl.style.color = 'var(--text2)'; }
+    if (countEl) { countEl.textContent = 'night'; countEl.style.color = 'var(--text2)'; }
+    if (_hmBaseImage && _hmBaseImage.complete) {
+      _smCtx.clearRect(0, 0, _smCanvas.width, _smCanvas.height);
+      _smCtx.drawImage(_hmBaseImage, 0, 0);
+    }
+    return;
+  }
 
   if (statusEl) {
-    statusEl.textContent = isNight
-      ? 'Below horizon'
-      : `Az ${sun.azimuth.toFixed(1)}\u00B0  El ${sun.elevation.toFixed(1)}\u00B0`;
+    statusEl.textContent = `Az ${sp.azimuth.toFixed(1)}\u00B0  El ${sp.elevation.toFixed(1)}\u00B0`;
+    statusEl.style.color = 'var(--sun)';
   }
 
-  // Per-sub-panel shade check
-  const { rows, cols, nSubs } = _smLayout;
-  const subPanels = _results.subPanels;
-  const subResults = _results.subResults;
-  const az = Math.round(sun.azimuth) % 360;
-  const totalSubs = subPanels.length;
-  const shadeState = new Uint8Array(totalSubs); // 0=shaded, 1=lit
-
-  if (!isNight) {
-    for (let i = 0; i < totalSubs; i++) {
-      const h = _subHorizons[i];
-      shadeState[i] = sun.elevation > h[az] ? 1 : 0;
-    }
-  }
-
-  // Count panel shade status (0 subs shaded, some, all)
-  let shadedPanelCount = 0;
-  for (let p = 0; p < rows * cols; p++) {
-    let shadedSubs = 0;
-    for (let s = 0; s < nSubs; s++) {
-      if (!shadeState[p * nSubs + s]) shadedSubs++;
-    }
-    if (shadedSubs > 0) shadedPanelCount++;
-  }
-
-  if (countEl) {
-    countEl.textContent = isNight
-      ? '\u2014'
-      : `${shadedPanelCount} / ${rows * cols}`;
-  }
-
-  // Draw
-  drawShadeMapCanvas(sun, isNight, shadeState, subResults);
-}
-
-function drawShadeMapCanvas(sun, isNight, shadeState, subResults) {
+  // Restore base heatmap
   const ctx = _smCtx;
-  const L = _smLayout;
-  const w = _smCanvas.width / _smDpr;
-  const h = _smCanvas.height / _smDpr;
+  const can = _smCanvas;
+  if (_hmBaseImage && _hmBaseImage.complete) {
+    ctx.clearRect(0, 0, can.width, can.height);
+    ctx.drawImage(_hmBaseImage, 0, 0);
+  }
 
-  ctx.clearRect(0, 0, w, h);
+  // Draw sun dot overlay
+  const W = can.width, H = can.height;
+  const pad = _hmPad;
+  const dw = W - pad.l - pad.r;
+  const dh = H - pad.t - pad.b;
 
-  const { rows, cols, nSubs, panelW, panelH, originX, originY, gap, diodeSplit } = L;
+  if (sp.azimuth >= 60 && sp.azimuth <= 300 && sp.elevation > 0 && sp.elevation < 80) {
+    const sx = pad.l + ((sp.azimuth - 60) / 240) * dw;
+    const sy = pad.t + dh * (1 - sp.elevation / 80);
 
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const px = originX + c * (panelW + gap);
-      const py = originY + r * (panelH + gap);
+    // Glow
+    const g = ctx.createRadialGradient(sx, sy, 0, sx, sy, 18);
+    g.addColorStop(0, 'rgba(245,166,35,0.5)');
+    g.addColorStop(0.5, 'rgba(245,166,35,0.15)');
+    g.addColorStop(1, 'rgba(245,166,35,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(sx, sy, 18, 0, Math.PI * 2);
+    ctx.fill();
 
-      // Draw sub-panels
-      for (let s = 0; s < nSubs; s++) {
-        const idx = (r * cols + c) * nSubs + s;
-        const sr = subResults[idx];
-        const sav = sr ? sr.sav : 1;
-        const isLit = shadeState[idx];
+    // Solid dot
+    ctx.beginPath();
+    ctx.arc(sx, sy, 5, 0, Math.PI * 2);
+    ctx.fillStyle = '#f5a623';
+    ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
 
-        let sx, sy, sw, sh;
-        if (diodeSplit === 'vertical') {
-          sw = panelW / nSubs;
-          sh = panelH;
-          sx = px + s * sw;
-          sy = py;
-        } else {
-          sw = panelW;
-          sh = panelH / nSubs;
-          sx = px;
-          sy = py + s * sh;
-        }
-
-        // Fill color depends on mode
-        if (isNight) {
-          ctx.fillStyle = 'rgba(255,255,255,0.04)';
-        } else if (isLit) {
-          // Lit — tint by SAV (green to yellow)
-          ctx.fillStyle = savToLitColor(sav);
-        } else {
-          // Shaded — orange to red based on SAV
-          ctx.fillStyle = savToShadedColor(sav);
-        }
-
-        smRoundRect(ctx, sx, sy, sw, sh, 2);
-        ctx.fill();
-
-        // Border
-        ctx.strokeStyle = isNight
-          ? 'rgba(255,255,255,0.06)'
-          : isLit ? 'rgba(34,197,94,0.5)' : 'rgba(239,68,68,0.5)';
-        ctx.lineWidth = 0.5;
-        ctx.stroke();
-      }
-
-      // Diode split lines
-      ctx.save();
-      ctx.strokeStyle = 'rgba(255,255,255,0.1)';
-      ctx.lineWidth = 0.5;
-      ctx.setLineDash([2, 2]);
-      if (diodeSplit === 'vertical') {
-        for (let s = 1; s < nSubs; s++) {
-          const lx = px + (s / nSubs) * panelW;
-          ctx.beginPath(); ctx.moveTo(lx, py + 1); ctx.lineTo(lx, py + panelH - 1); ctx.stroke();
-        }
-      } else {
-        for (let s = 1; s < nSubs; s++) {
-          const ly = py + (s / nSubs) * panelH;
-          ctx.beginPath(); ctx.moveTo(px + 1, ly); ctx.lineTo(px + panelW - 1, ly); ctx.stroke();
-        }
-      }
-      ctx.restore();
-
-      // Panel label
-      if (panelW > 22) {
-        ctx.save();
-        ctx.font = panelW > 40
-          ? '9px "JetBrains Mono", monospace'
-          : '7px "JetBrains Mono", monospace';
-        ctx.fillStyle = isNight ? 'rgba(255,255,255,0.1)' : 'rgba(255,255,255,0.4)';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(`${String.fromCharCode(65 + r)}${c + 1}`, px + panelW / 2, py + panelH / 2);
-        ctx.restore();
-      }
+    // Rays
+    for (let a = 0; a < 8; a++) {
+      const an = a * Math.PI / 4;
+      ctx.beginPath();
+      ctx.moveTo(sx + Math.cos(an) * 8, sy + Math.sin(an) * 8);
+      ctx.lineTo(sx + Math.cos(an) * 12, sy + Math.sin(an) * 12);
+      ctx.strokeStyle = '#f5a623';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
     }
   }
-}
 
-function savToLitColor(sav) {
-  // Full sun: high SAV = bright green, lower = yellow-green
-  const g = Math.round(140 + sav * 57);    // 140–197
-  const r = Math.round(34 + (1 - sav) * 180); // 34–214
-  const b = Math.round(94 * sav);          // 0–94
-  return `rgba(${r},${g},${b},0.45)`;
-}
-
-function savToShadedColor(sav) {
-  // Shaded: lower SAV = redder, higher = orange
-  const r = Math.round(200 + (1 - sav) * 45);  // 200–245
-  const g = Math.round(sav * 130);               // 0–130
-  const b = Math.round(sav * 50);                // 0–50
-  return `rgba(${r},${g},${b},0.5)`;
-}
-
-function smRoundRect(ctx, x, y, w, h, r) {
-  ctx.beginPath();
-  if (ctx.roundRect) {
-    ctx.roundRect(x, y, w, h, r);
-  } else {
-    ctx.moveTo(x + r, y);
-    ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y, x + w, y + r, r);
-    ctx.lineTo(x + w, y + h - r); ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
-    ctx.lineTo(x + r, y + h); ctx.arcTo(x, y + h, x, y + h - r, r);
-    ctx.lineTo(x, y + r); ctx.arcTo(x, y, x + r, y, r);
-    ctx.closePath();
+  // Compute shaded count
+  const az = Math.round(sp.azimuth) % 360;
+  let shadedCount = 0;
+  const n = _subHorizons.length;
+  for (let i = 0; i < n; i++) {
+    if (sp.elevation <= _subHorizons[i][az]) shadedCount++;
+  }
+  if (countEl) {
+    countEl.textContent = `${shadedCount}/${n}`;
+    countEl.style.color = shadedCount > 0 ? 'var(--loss)' : 'var(--gain)';
   }
 }
 
@@ -846,7 +897,7 @@ function haToStr(ha) {
   return (h > 12 ? h - 12 : (h || 12)) + ':' + String(m).padStart(2, '0') + (h >= 12 ? 'pm' : 'am');
 }
 
-// ─── End Shade Map ────────────────────────────────────
+// ─── End Sky Visibility Heatmap ───────────────────────
 
 function cfgItem(label, value) {
   return `<div style="padding:8px 12px;background:var(--surface2);border-radius:var(--radius-sm);font-size:12px">
