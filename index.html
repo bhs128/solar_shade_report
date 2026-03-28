@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SolarScope — Shade Analysis Tool</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <nav id="main-nav">
+    <div class="nav-brand">
+      <span class="brand-icon">&#9788;</span>
+      <span class="brand-text">SolarScope</span>
+    </div>
+    <div class="nav-tabs">
+      <button class="nav-tab active" data-view="setup">Setup</button>
+      <button class="nav-tab" data-view="array">Array &amp; Photos</button>
+      <button class="nav-tab" data-view="editor">Shade Editor</button>
+      <button class="nav-tab" data-view="report">Report</button>
+    </div>
+    <div class="nav-actions">
+      <button class="btn btn-sm" id="btn-save-project" title="Save project to file">Save</button>
+      <button class="btn btn-sm" id="btn-load-project" title="Load project from file">Load</button>
+      <input type="file" id="file-load-project" accept=".json" style="display:none">
+      <span id="engine-status" class="status-badge loading">Loading PVLib...</span>
+    </div>
+  </nav>
+
+  <main id="app">
+    <section id="view-setup" class="view active"></section>
+    <section id="view-array" class="view"></section>
+    <section id="view-editor" class="view"></section>
+    <section id="view-report" class="view"></section>
+  </main>
+
+  <div id="modal-backdrop" class="modal-backdrop hidden"></div>
+  <div id="modal-container"></div>
+
+  <div id="loading-overlay">
+    <div class="loading-content">
+      <div class="loading-spinner"></div>
+      <h2>Initializing Solar Engine</h2>
+      <p id="loading-message">Loading Python environment...</p>
+      <div class="loading-bar"><div id="loading-progress"></div></div>
+      <button class="btn" id="btn-skip-loading" style="margin-top:16px;display:none">Use JS Fallback</button>
+    </div>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
