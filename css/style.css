@@ -653,6 +653,9 @@ table.data-tbl th {
   }
   #main-nav { flex-wrap: wrap; gap: 8px; }
   .nav-tabs { order: 3; width: 100%; justify-content: center; }
+  #point-panel > div[style*="grid-template-columns"] {
+    grid-template-columns: 1fr !important;
+  }
 }
 
 /* --- LOADING --- */

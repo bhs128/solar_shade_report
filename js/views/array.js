@@ -19,6 +19,7 @@ const PAD = 30;
 const GAP = 4;
 const PT_R = 7;
 const MIN_PANEL_W = 28;
+const SNAP_PX = 12;
 const LABEL_FONT = '9px "JetBrains Mono", monospace';
 const PT_FONT = '10px "JetBrains Mono", monospace';
 
@@ -62,59 +63,56 @@ function buildUI() {
 
   _container.innerHTML = `
     <div class="fade-in">
-      <div class="grid-2">
-        <!-- LEFT: Canvas Array -->
-        <div class="card">
-          <div class="card-header">
-            <h2>Array Diagram</h2>
-            <div style="display:flex;gap:6px">
-              <button class="btn btn-sm" id="btn-add-pt">+ Add Point</button>
-              <button class="btn btn-sm btn-danger" id="btn-del-pt" disabled>Delete Point</button>
-            </div>
-          </div>
-          <p class="hint" style="margin-bottom:8px">
-            Click <strong>+ Add Point</strong> to create measurement points.
-            Drag to position. Select a point to assign a photo.
-          </p>
-          <div id="canvas-wrap" style="position:relative;width:100%;background:var(--surface2);border-radius:var(--radius-sm);overflow:hidden">
-            <canvas id="array-canvas" style="display:block;width:100%"></canvas>
-          </div>
-          <div class="legend-row" style="justify-content:center;margin-top:10px;gap:16px">
-            <span class="legend-label" style="display:flex;align-items:center;gap:4px">
-              <span style="width:10px;height:10px;border-radius:50%;background:var(--text3);display:inline-block"></span> No photo
-            </span>
-            <span class="legend-label" style="display:flex;align-items:center;gap:4px">
-              <span style="width:10px;height:10px;border-radius:50%;background:var(--shade);display:inline-block"></span> Photo
-            </span>
-            <span class="legend-label" style="display:flex;align-items:center;gap:4px">
-              <span style="width:10px;height:10px;border-radius:50%;background:var(--gain);display:inline-block"></span> Traced
-            </span>
-            <span class="legend-label" style="display:flex;align-items:center;gap:4px">
-              <span style="width:10px;height:10px;border-radius:50%;border:2px solid var(--sun);background:transparent;display:inline-block"></span> Selected
-            </span>
+      <!-- Full-width Array Diagram -->
+      <div class="card">
+        <div class="card-header">
+          <h2>Array Diagram</h2>
+          <div style="display:flex;gap:6px">
+            <button class="btn btn-sm" id="btn-add-pt">+ Add Point</button>
+            <button class="btn btn-sm btn-danger" id="btn-del-pt" disabled>Delete Point</button>
           </div>
         </div>
+        <p class="hint" style="margin-bottom:8px">
+          Click <strong>+ Add Point</strong> to create measurement points.
+          Drag to position—snaps to center, edges &amp; corners. Select a point to assign a photo.
+        </p>
+        <div id="canvas-wrap" style="position:relative;width:100%;background:var(--surface2);border-radius:var(--radius-sm);overflow:hidden">
+          <canvas id="array-canvas" style="display:block;width:100%"></canvas>
+        </div>
+        <div class="legend-row" style="justify-content:center;margin-top:10px;gap:16px">
+          <span class="legend-label" style="display:flex;align-items:center;gap:4px">
+            <span style="width:10px;height:10px;border-radius:50%;background:var(--text3);display:inline-block"></span> No photo
+          </span>
+          <span class="legend-label" style="display:flex;align-items:center;gap:4px">
+            <span style="width:10px;height:10px;border-radius:50%;background:var(--shade);display:inline-block"></span> Photo
+          </span>
+          <span class="legend-label" style="display:flex;align-items:center;gap:4px">
+            <span style="width:10px;height:10px;border-radius:50%;background:var(--gain);display:inline-block"></span> Traced
+          </span>
+          <span class="legend-label" style="display:flex;align-items:center;gap:4px">
+            <span style="width:10px;height:10px;border-radius:50%;border:2px solid var(--sun);background:transparent;display:inline-block"></span> Selected
+          </span>
+        </div>
+      </div>
 
-        <!-- RIGHT: Point Detail & Photos -->
-        <div class="card" id="point-panel">
-          <div class="card-header">
-            <h2 id="point-panel-title">Point Detail</h2>
-            <span class="hint" id="photo-count">${Object.keys(state.photos).length} photo(s)</span>
-          </div>
-          <div id="point-detail-area"></div>
-
-          <!-- Photo library -->
-          <div id="photo-library" style="margin-top:16px;border-top:1px solid var(--border);padding-top:12px">
-            <h3 style="font-size:12px;color:var(--text2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px">
-              Photo Library
-            </h3>
-            <div class="upload-zone" id="upload-zone" style="padding:16px">
-              <div class="upload-icon" style="font-size:24px">&#128247;</div>
-              <div class="upload-text" style="font-size:12px">Drop photos or click to upload</div>
+      <!-- Point Detail & Photo Library -->
+      <div class="card" id="point-panel">
+        <div class="card-header">
+          <h2 id="point-panel-title">Point Detail</h2>
+          <span class="hint" id="photo-count">${Object.keys(state.photos).length} photo(s)</span>
+        </div>
+        <div style="display:grid;grid-template-columns:160px 1fr;gap:16px;min-height:180px">
+          <!-- LEFT: Photo Filmstrip -->
+          <div style="border-right:1px solid var(--border);padding-right:12px;display:flex;flex-direction:column;gap:8px">
+            <div class="upload-zone" id="upload-zone" style="padding:10px;cursor:pointer;flex-shrink:0">
+              <div style="font-size:16px;opacity:0.4">&#128247;</div>
+              <div class="upload-text" style="font-size:10px">Upload photos</div>
             </div>
             <input type="file" id="file-photo-input" accept="image/*" multiple style="display:none">
-            <div class="photo-grid" id="photo-list" style="margin-top:8px"></div>
+            <div id="photo-list" style="display:flex;flex-direction:column;gap:6px;overflow-y:auto;flex:1;max-height:360px"></div>
           </div>
+          <!-- RIGHT: Point Detail -->
+          <div id="point-detail-area"></div>
         </div>
       </div>
 
@@ -250,6 +248,11 @@ function drawArray() {
     for (let c = 0; c < cols; c++)
       drawPanel(r, c, state);
 
+  // Snap targets (while dragging)
+  if (_dragging && _dragCurrentPanel) {
+    drawSnapTargets(_dragCurrentPanel.row, _dragCurrentPanel.col);
+  }
+
   // Points
   drawPoints(state);
 }
@@ -371,6 +374,18 @@ function drawPoint(pt, selected, hovered, state) {
   _ctx.restore();
 }
 
+function drawSnapTargets(row, col) {
+  const targets = getSnapTargets(row, col);
+  _ctx.save();
+  for (const t of targets) {
+    _ctx.beginPath();
+    _ctx.arc(t.cx, t.cy, 2.5, 0, Math.PI * 2);
+    _ctx.fillStyle = 'rgba(245,166,35,0.35)';
+    _ctx.fill();
+  }
+  _ctx.restore();
+}
+
 /** Canvas-safe roundRect (fallback for older browsers) */
 function roundRect(x, y, w, h, r) {
   _ctx.beginPath();
@@ -423,6 +438,57 @@ function toLocal(mx, my, row, col) {
   return { lx: (mx - r.x) / r.w, ly: (my - r.y) / r.h };
 }
 
+// ─── Snap Logic ───────────────────────────────────────
+
+function getSnapTargets(row, col) {
+  const { diodeSplit, diodeSubsections } = getState().system;
+  const nSubs = diodeSubsections || 2;
+  const r = pRect(row, col);
+  const M = 0.05; // margin from edge (same as clamp min)
+  const targets = [
+    // Center
+    { lx: 0.5, ly: 0.5 },
+    // Corners
+    { lx: M, ly: M }, { lx: 1 - M, ly: M },
+    { lx: M, ly: 1 - M }, { lx: 1 - M, ly: 1 - M },
+    // Edge midpoints
+    { lx: 0.5, ly: M }, { lx: 0.5, ly: 1 - M },
+    { lx: M, ly: 0.5 }, { lx: 1 - M, ly: 0.5 },
+  ];
+  // Diode split midpoints
+  for (let s = 1; s < nSubs; s++) {
+    const f = s / nSubs;
+    if (diodeSplit === 'vertical') {
+      targets.push({ lx: f, ly: 0.5 });
+    } else {
+      targets.push({ lx: 0.5, ly: f });
+    }
+  }
+  // Convert to canvas coords
+  return targets.map(t => ({
+    lx: t.lx, ly: t.ly,
+    cx: r.x + t.lx * r.w,
+    cy: r.y + t.ly * r.h,
+  }));
+}
+
+function snapLocal(mx, my, row, col) {
+  const { lx, ly } = toLocal(mx, my, row, col);
+  const cLx = clamp(lx, 0.05, 0.95);
+  const cLy = clamp(ly, 0.05, 0.95);
+  const targets = getSnapTargets(row, col);
+  let bestD2 = SNAP_PX * SNAP_PX;
+  let best = null;
+  for (const t of targets) {
+    const dx = mx - t.cx, dy = my - t.cy;
+    const d2 = dx * dx + dy * dy;
+    if (d2 < bestD2) { bestD2 = d2; best = t; }
+  }
+  return best
+    ? { lx: best.lx, ly: best.ly, snapped: true }
+    : { lx: cLx, ly: cLy, snapped: false };
+}
+
 // ─── Mouse / Touch ────────────────────────────────────
 
 function onMouseDown(e) {
@@ -452,16 +518,12 @@ function onMouseMove(e) {
     const panel = panelAtPos(pos.x, pos.y);
 
     if (panel) {
-      // Cursor is inside a panel — move point there
       _dragCurrentPanel = panel;
-      const { lx, ly } = toLocal(pos.x, pos.y, panel.row, panel.col);
-      moveMeasurementPoint(_selectedPtId, panel.col, panel.row,
-        clamp(lx, 0.05, 0.95), clamp(ly, 0.05, 0.95));
+      const s = snapLocal(pos.x, pos.y, panel.row, panel.col);
+      moveMeasurementPoint(_selectedPtId, panel.col, panel.row, s.lx, s.ly);
     } else if (_dragCurrentPanel) {
-      // Cursor outside panels — clamp to current panel edge
-      const { lx, ly } = toLocal(pos.x, pos.y, _dragCurrentPanel.row, _dragCurrentPanel.col);
-      moveMeasurementPoint(_selectedPtId, _dragCurrentPanel.col, _dragCurrentPanel.row,
-        clamp(lx, 0.05, 0.95), clamp(ly, 0.05, 0.95));
+      const s = snapLocal(pos.x, pos.y, _dragCurrentPanel.row, _dragCurrentPanel.col);
+      moveMeasurementPoint(_selectedPtId, _dragCurrentPanel.col, _dragCurrentPanel.row, s.lx, s.ly);
     }
 
     drawArray();
@@ -647,17 +709,17 @@ function photoDetailHTML(photo) {
       <h3 style="font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px">
         Assigned Photo
       </h3>
-      <div style="display:flex;gap:12px;align-items:flex-start">
-        <img src="${photo.dataUrl}" style="width:100px;height:60px;object-fit:cover;border-radius:4px;flex-shrink:0">
-        <div style="font-size:11px;min-width:0">
-          <div style="font-weight:600;word-break:break-all">${esc(photo.filename)}</div>
-          ${meta.compassHeading != null
-            ? `<div style="color:var(--gain);margin-top:2px">Heading: ${meta.compassHeading.toFixed(1)}\u00B0</div>`
-            : '<div style="color:var(--sun);margin-top:2px">No compass heading</div>'}
-          <div style="color:var(--text3);margin-top:2px">${traceCount} trace(s) drawn</div>
-        </div>
+      <div style="border-radius:6px;overflow:hidden;margin-bottom:10px;background:#000">
+        <img src="${photo.dataUrl}" style="width:100%;max-height:200px;object-fit:contain;display:block">
       </div>
-      <div style="display:flex;gap:6px;margin-top:8px">
+      <div style="font-size:12px">
+        <div style="font-weight:600;word-break:break-all;margin-bottom:4px">${esc(photo.filename)}</div>
+        ${meta.compassHeading != null
+          ? `<div style="color:var(--gain)">Heading: ${meta.compassHeading.toFixed(1)}\u00B0</div>`
+          : '<div style="color:var(--sun)">No compass heading</div>'}
+        <div style="color:var(--text3);margin-top:2px">${traceCount} trace(s) drawn</div>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:10px">
         <button class="btn btn-sm" id="btn-pt-editor">Open in Editor \u2192</button>
         <button class="btn btn-sm" id="btn-pt-unassign">Unassign</button>
       </div>
@@ -752,25 +814,27 @@ function buildPhotoList() {
   if (photos.length === 0) return;
 
   for (const photo of photos) {
-    const card = el('div', { class: 'photo-card' });
-    card.style.cursor = 'pointer';
+    const thumb = el('div');
+    thumb.style.cssText = 'display:flex;gap:8px;padding:6px;border-radius:var(--radius-sm);background:var(--surface2);cursor:pointer;transition:border-color 0.15s;border:1px solid transparent;align-items:center';
 
     const img = el('img');
     img.src = photo.dataUrl;
     img.alt = photo.filename;
-    card.appendChild(img);
+    img.style.cssText = 'width:48px;height:36px;object-fit:cover;border-radius:3px;flex-shrink:0';
+    thumb.appendChild(img);
 
-    const info = el('div', { class: 'photo-info' });
+    const info = el('div');
+    info.style.cssText = 'min-width:0;overflow:hidden';
     info.innerHTML = `
-      <div class="photo-name">${esc(photo.filename)}</div>
-      <div class="photo-meta">
-        <span style="font-size:10px;color:var(--text3)">${photo.coveragePoints.length} pt(s)</span>
-      </div>
+      <div style="font-size:10px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(photo.filename)}</div>
+      <div style="font-size:9px;color:var(--text3);margin-top:1px">${photo.coveragePoints.length} pt(s)</div>
     `;
-    card.appendChild(info);
+    thumb.appendChild(info);
 
-    // Click to assign
-    card.addEventListener('click', () => {
+    thumb.addEventListener('mouseenter', () => { thumb.style.borderColor = 'var(--sun)'; });
+    thumb.addEventListener('mouseleave', () => { thumb.style.borderColor = 'transparent'; });
+
+    thumb.addEventListener('click', () => {
       if (_selectedPtId) {
         assignPhotoToPoints(photo.id, [_selectedPtId]);
         updatePointPanel();
@@ -779,11 +843,11 @@ function buildPhotoList() {
       }
     });
 
-    card.title = _selectedPtId
+    thumb.title = _selectedPtId
       ? 'Click to assign to selected point'
       : 'Select a point first to assign';
 
-    listEl.appendChild(card);
+    listEl.appendChild(thumb);
   }
 }
 
