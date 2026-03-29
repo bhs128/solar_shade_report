@@ -203,6 +203,7 @@ function buildEditorUI() {
   buildTraceList();
   bindEditorEvents();
   loadMaskFromState();
+  prefillFisheyeCorners();
   redraw();
 }
 
@@ -343,9 +344,28 @@ function loadMaskFromState() {
   img.onload = () => {
     _maskCtx.clearRect(0, 0, _maskCanvas.width, _maskCanvas.height);
     _maskCtx.drawImage(img, 0, 0, _maskCanvas.width, _maskCanvas.height);
+    prefillFisheyeCorners();
     redraw();
   };
   img.src = trace.groundMask;
+}
+
+/**
+ * Fill the rectangular corners outside the fisheye circle with ground mask.
+ * These areas are always below the panel and should be treated as ground.
+ */
+function prefillFisheyeCorners() {
+  if (!_isFisheye || !_maskCanvas) return;
+  const W = _maskCanvas.width, H = _maskCanvas.height;
+  const cx = W / 2, cy = H / 2, R = Math.min(W, H) / 2;
+  _maskCtx.save();
+  // Fill only the corners (rect minus circle) using evenodd fill rule
+  _maskCtx.beginPath();
+  _maskCtx.rect(0, 0, W, H);
+  _maskCtx.arc(cx, cy, R, 0, Math.PI * 2, true);
+  _maskCtx.fillStyle = 'rgba(230, 60, 60, 0.85)';
+  _maskCtx.fill('evenodd');
+  _maskCtx.restore();
 }
 
 function saveMaskToState() {
@@ -521,8 +541,8 @@ function drawGrid(W, H) {
     // Elevation rings
     for (let el = 10; el <= 80; el += 10) {
       _ctx.beginPath();
-      _ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-      _ctx.lineWidth = 0.5;
+      _ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+      _ctx.lineWidth = 1;
       const pts = [];
       for (let az = 0; az < 360; az += 2) {
         const p = skyToCanvas(az, el);
@@ -536,10 +556,10 @@ function drawGrid(W, H) {
       _ctx.stroke();
 
       // Label
-      if (el % 30 === 0) {
+      if (el % 20 === 0) {
         const lp = skyToCanvas(0, el);
         if (lp.visible) {
-          _ctx.fillStyle = 'rgba(255,255,255,0.3)';
+          _ctx.fillStyle = 'rgba(255,255,255,0.55)';
           _ctx.textAlign = 'center';
           _ctx.fillText(`${el}°`, lp.x, lp.y - 3);
         }
@@ -555,14 +575,14 @@ function drawGrid(W, H) {
         _ctx.beginPath();
         _ctx.moveTo(p0.x, p0.y);
         _ctx.lineTo(p1.x, p1.y);
-        _ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-        _ctx.lineWidth = 0.5;
+        _ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+        _ctx.lineWidth = 1;
         _ctx.stroke();
       }
       const label = cardinals[az] || `${az}°`;
       const lp = skyToCanvas(az, 2);
       if (lp.visible) {
-        _ctx.fillStyle = cardinals[az] ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.25)';
+        _ctx.fillStyle = cardinals[az] ? 'rgba(255,255,255,0.7)' : 'rgba(255,255,255,0.4)';
         _ctx.textAlign = 'center';
         _ctx.fillText(label, lp.x, lp.y + 12);
       }
@@ -623,7 +643,16 @@ function drawGrid(W, H) {
 function drawSunPaths(W, H) {
   const state = getState();
   const lat = state.location.lat;
-  if (lat == null) return;
+  if (lat == null) {
+    // Show a note so user knows why sun paths are missing
+    _ctx.save();
+    _ctx.fillStyle = 'rgba(245,168,35,0.8)';
+    _ctx.font = '12px "JetBrains Mono", monospace';
+    _ctx.textAlign = 'center';
+    _ctx.fillText('Set location in Setup to show sun paths', W / 2, _isFisheye ? 30 : 16);
+    _ctx.restore();
+    return;
+  }
 
   // Get mask data for shading detection
   const maskId = _maskCtx.getImageData(0, 0, _maskCanvas.width, _maskCanvas.height);

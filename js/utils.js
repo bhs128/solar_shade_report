@@ -367,11 +367,15 @@ async function parseInspAccelerometer(file) {
   if (!exifr) return null;
   try {
     const parsed = await exifr.parse(file, {
-      tiff: true, ifd0: { pick: [0x927C] }, // MakerNote tag
+      tiff: true, exif: true,    // MakerNote (0x927C) lives in ExifIFD, not IFD0
       translateValues: false,
+      mergeOutput: true,
     });
     const mn = parsed?.MakerNote;
-    if (!mn) return null;
+    if (!mn) {
+      console.warn('[SolarScope] MakerNote not found in EXIF data');
+      return null;
+    }
     const bytes = mn instanceof Uint8Array ? mn : new Uint8Array(mn);
     let end = bytes.length;
     for (let i = 0; i < bytes.length; i++) {
@@ -380,9 +384,13 @@ async function parseInspAccelerometer(file) {
     const ascii = new TextDecoder('ascii').decode(bytes.slice(0, end));
     const vals = ascii.split('_').map(Number);
     if (vals.length >= 6 && vals.every(v => !isNaN(v))) {
+      console.log('[SolarScope] Accelerometer parsed:', { ax: vals[0], ay: vals[1], az: vals[2], gx: vals[3], gy: vals[4], gz: vals[5] });
       return { ax: vals[0], ay: vals[1], az: vals[2], gx: vals[3], gy: vals[4], gz: vals[5] };
     }
-  } catch (e) { /* ignore */ }
+    console.warn('[SolarScope] MakerNote found but could not parse accel data. First 60 bytes:', ascii.slice(0, 60));
+  } catch (e) {
+    console.warn('[SolarScope] Error parsing MakerNote accelerometer:', e.message);
+  }
   return null;
 }
 
@@ -1008,9 +1016,8 @@ export function buildSkyMaskLookup(photo, maskData, systemDefaults = {}) {
     return (az, el) => {
       const fp = skyToFisheye(az, el, worldToCamera, imgSize, fov);
       if (!fp.visible) return false;
-      const ix = Math.round(fp.x);
-      const iy = Math.round(fp.y);
-      if (ix < 0 || ix >= width || iy < 0 || iy >= height) return false;
+      const ix = Math.max(0, Math.min(width - 1, Math.round(fp.x)));
+      const iy = Math.max(0, Math.min(height - 1, Math.round(fp.y)));
       return data[(iy * width + ix) * 4 + 3] > 128;
     };
   } else {
