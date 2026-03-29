@@ -152,6 +152,14 @@ export function addPhoto(photoData) {
       croppedHeight: photoData.metadata?.croppedHeight || null,
       raw: photoData.metadata?.raw || {},
     },
+    // Fisheye-specific fields (Insta360 / hemisphere cameras)
+    fisheye: photoData.fisheye || null,
+    // { fov, accelTilt, accelClockAngle, lensSide, calibration }
+    // Ground mask for fisheye shade analysis
+    groundMask: photoData.groundMask || null,
+    // Orientation overrides set by user in editor
+    orientation: photoData.orientation || null,
+    // { panelAzimuth, panelTilt, clockAngle } — null = use defaults from system config
     coveragePoints: photoData.coveragePoints || [],
     traces: photoData.traces || {
       'As-Is': {
@@ -160,6 +168,7 @@ export function addPhoto(photoData) {
         color: '#3b82f6',
         paths: [],
         horizonProfile: null,
+        groundMask: null,
       },
     },
   };
@@ -203,6 +212,7 @@ export function addTrace(photoId, traceName, color = null) {
     color: color || colors[idx % colors.length],
     paths: [],
     horizonProfile: null,
+    groundMask: null,
   };
   emit('photos');
 }
@@ -449,4 +459,24 @@ export function getHorizonForPoint(pointId, scenario = null) {
   if (!trace) return new Float32Array(360);
   if (trace.horizonProfile) return trace.horizonProfile;
   return new Float32Array(360); // no trace drawn yet
+}
+
+/**
+ * Get the photo assigned to a measurement point.
+ */
+export function getPhotoForPoint(pointId) {
+  if (!pointId) return null;
+  const pt = _state.points[pointId];
+  if (!pt || !pt.photoId) return null;
+  return _state.photos[pt.photoId] || null;
+}
+
+/**
+ * Get the trace for a measurement point under a given scenario.
+ */
+export function getTraceForPoint(pointId, scenario = null) {
+  const photo = getPhotoForPoint(pointId);
+  if (!photo) return null;
+  const scn = scenario || _state.activeScenario;
+  return photo.traces[scn] || photo.traces['As-Is'] || null;
 }

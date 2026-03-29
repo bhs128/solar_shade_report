@@ -5,7 +5,8 @@
  * weather derating, temperature model, and full energy yield computation.
  */
 
-import { getState, getSubPanels, getMergedHorizon, getHorizonForPoint } from './state.js';
+import { getState, getSubPanels, getMergedHorizon, getHorizonForPoint, getPhotoForPoint, getTraceForPoint } from './state.js';
+import { decodeMaskDataUrl, buildSkyMaskLookup, buildMergedMaskLookup } from './utils.js';
 
 const DEG = Math.PI / 180;
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -17,6 +18,47 @@ const MDAYS_CUM = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365];
 // ============================================================
 
 export { MONTHS, MDAYS, MDAYS_CUM };
+
+// ============================================================
+// Mask-based shade lookup helpers
+// ============================================================
+
+/**
+ * Build a shade lookup from a photo's trace data.
+ * Supports both 2D groundMask (preferred) and legacy 1D horizonProfile.
+ */
+async function _buildShadeLookup(photo, trace, systemDefaults) {
+  if (trace?.groundMask) {
+    const maskData = await decodeMaskDataUrl(trace.groundMask);
+    return buildSkyMaskLookup(photo, maskData, systemDefaults);
+  }
+  if (trace?.horizonProfile) {
+    const h = trace.horizonProfile;
+    return (az, el) => el <= h[Math.round(az) % 360];
+  }
+  return () => false;
+}
+
+/**
+ * Build merged shade lookups for a set of point IDs.
+ * Returns (az, el) => boolean — shaded if ANY point's mask says so.
+ */
+export async function buildMergedShadeLookupForPoints(ptIds, scenario) {
+  const state = getState();
+  const systemDefaults = { azimuth: state.system.azimuth, tilt: state.system.tilt };
+  const scn = scenario || state.activeScenario;
+  const lookups = [];
+  const seen = new Set();
+  for (const pid of ptIds) {
+    const photo = getPhotoForPoint(pid);
+    if (!photo || seen.has(photo.id)) continue;
+    seen.add(photo.id);
+    const trace = photo.traces[scn] || photo.traces['As-Is'];
+    const fn = await _buildShadeLookup(photo, trace, systemDefaults);
+    lookups.push(fn);
+  }
+  return buildMergedMaskLookup(lookups);
+}
 
 /** Engine readiness state */
 let _pyodideReady = false;
@@ -178,11 +220,15 @@ function tempDerate(tCellC) {
 /**
  * Compute full irradiance metrics for a single measurement point.
  * Returns monthly SAV, POA values, hourly access, and annual totals.
+ *
+ * @param {function} shadeLookup - (az, el) => boolean, true = shaded
+ * @param {number} lat - latitude
+ * @param {number} tilt - panel tilt degrees
+ * @param {number} panelAz - panel azimuth degrees
  */
-export function computePointIrradiance(horizonProfile, lat, tilt, panelAz) {
+export function computePointIrradiance(shadeLookup, lat, tilt, panelAz) {
   const allPaths = computeAllSunPaths(lat);
   const weather = getWeatherParams(lat);
-  const h = horizonProfile;
 
   const mPOA_clear = new Float32Array(12);
   const mPOA_weather = new Float32Array(12);
@@ -208,8 +254,7 @@ export function computePointIrradiance(horizonProfile, lat, tilt, panelAz) {
       const poaClearPt = poaIrradiance(dniClear, dhiClear, ghiClear, pt.elevation, pt.azimuth, tilt, panelAz);
       poaClear += poaClearPt.total;
 
-      const az = Math.round(pt.azimuth) % 360;
-      const isShaded = pt.elevation <= h[az];
+      const isShaded = shadeLookup(pt.azimuth, pt.elevation);
 
       for (let ti = 0; ti < 3; ti++) {
         const tw = tierWeights[ti];
@@ -298,7 +343,7 @@ export function computeTOF(lat, tilt, panelAz) {
  * Returns comprehensive results for all half-panels, monthly/hourly tables,
  * and system-level kWh estimates.
  */
-export function runFullAnalysis(scenario = null) {
+export async function runFullAnalysis(scenario = null) {
   const state = getState();
   const { lat, lon } = state.location;
   if (lat == null) return null;
@@ -311,12 +356,14 @@ export function runFullAnalysis(scenario = null) {
   const subPanels = getSubPanels();
   const nSubs = subPanels.length > 0 ? subPanels[0].nSubs : 2;
 
-  // Pre-compute merged horizon for each sub-panel
-  const subHorizons = subPanels.map(sp => getMergedHorizon(sp.ptIds, scn));
+  // Pre-build shade lookups for each sub-panel (supports 2D masks + legacy horizons)
+  const subLookups = await Promise.all(
+    subPanels.map(sp => buildMergedShadeLookupForPoints(sp.ptIds, scn))
+  );
 
   // Per-sub-panel irradiance results
   const subResults = subPanels.map((sp, i) =>
-    computePointIrradiance(subHorizons[i], lat, tilt, azimuth)
+    computePointIrradiance(subLookups[i], lat, tilt, azimuth)
   );
 
   const tof = computeTOF(lat, tilt, azimuth);
@@ -361,8 +408,7 @@ export function runFullAnalysis(scenario = null) {
         const subBase = p * nSubs;
         let shadedSubs = 0;
         for (let s = 0; s < nSubs; s++) {
-          const h = subHorizons[subBase + s];
-          if (pt.elevation <= h[az]) shadedSubs++;
+          if (subLookups[subBase + s](pt.azimuth, pt.elevation)) shadedSubs++;
         }
 
         const dcClearMax = poaClearPt.total / 1000 * panelWp * sysEff;
@@ -437,9 +483,9 @@ export function runFullAnalysis(scenario = null) {
  * Run comparative analysis between two scenarios.
  * Returns { baseline, alternative, delta }
  */
-export function runComparison(baseScenario, altScenario) {
-  const baseline = runFullAnalysis(baseScenario);
-  const alternative = runFullAnalysis(altScenario);
+export async function runComparison(baseScenario, altScenario) {
+  const baseline = await runFullAnalysis(baseScenario);
+  const alternative = await runFullAnalysis(altScenario);
   if (!baseline || !alternative) return null;
 
   return {
@@ -461,11 +507,11 @@ export function runComparison(baseScenario, altScenario) {
 
 /**
  * Check if a sun position is shaded at a given measurement point.
+ * Async: decodes mask if needed. Falls back to legacy horizon profile.
  */
-export function isSunShaded(pointId, sunAz, sunEl, scenario = null) {
-  const horizon = getHorizonForPoint(pointId, scenario);
-  const azIdx = Math.round(sunAz) % 360;
-  return sunEl <= horizon[azIdx];
+export async function isSunShaded(pointId, sunAz, sunEl, scenario = null) {
+  const lookup = await buildMergedShadeLookupForPoints([pointId], scenario);
+  return lookup(sunAz, sunEl);
 }
 
 // ============================================================

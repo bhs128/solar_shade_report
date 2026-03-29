@@ -1,31 +1,56 @@
 /**
  * SolarScope — Shade Editor View
- * Equirectangular photo display with compass-aware tracing overlay.
- * Features: draw obstruction boundaries, multiple trace scenarios,
- * sun path overlay, horizon profile derivation.
+ * Unified ground-mask painting for equirectangular and fisheye projections.
+ * Features: brush-based mask painting, sun path overlay, horizon profile mini-chart.
  */
 
 import {
-  getState, setState, addTrace, updateTracePaths, subscribe
+  getState, setState, addTrace, subscribe
 } from '../state.js';
 import {
-  el, qs, qsa, clearEl, imageToSky, skyToImage, pathsToHorizon,
-  drawSkyGrid, debounce
+  el, qs, qsa, clearEl, imageToSky, skyToImage,
+  buildFisheyeRotation, skyToFisheye, fisheyeToSky,
+  sunPositionAtTime, maskLookupToHorizon, buildSkyMaskLookup,
+  decodeMaskDataUrl, debounce
 } from '../utils.js';
 import { computeAllSunPaths, sunPosition, solarDeclination, MONTHS } from '../solar-engine.js';
 
+// ============================================================
+// Module state
+// ============================================================
+
 let _container = null;
-let _photoId = null;       // Currently editing photo
-let _traceName = null;     // Currently editing trace
+let _photoId = null;
+let _traceName = null;
+
+// Display canvas (photo + overlays)
 let _canvas = null;
 let _ctx = null;
-let _img = null;           // Photo HTMLImageElement
-let _drawingMode = 'polyline'; // 'polyline' | 'freehand' | 'polygon'
-let _currentPath = [];     // Points being drawn [{x, y}] in normalized coords
-let _isDrawing = false;
+let _img = null;
+
+// Mask canvas (off-screen, stores ground mask)
+let _maskCanvas = null;
+let _maskCtx = null;
+
+// Projection state
+let _isFisheye = false;
+let _worldToCamera = null;
+let _fov = 90;
+
+// Brush state
+let _brushTool = 'ground';   // 'ground' | 'sky'
+let _brushSize = 30;
+let _isPainting = false;
+let _lastPaintPos = null;
+
+// Overlays
 let _showSunPaths = true;
 let _showGrid = true;
-let _viewUpper = true;     // Show only upper hemisphere
+let _showMask = true;
+
+// ============================================================
+// Public API
+// ============================================================
 
 export function render(container) {
   _container = container;
@@ -34,7 +59,6 @@ export function render(container) {
   const state = getState();
   const photos = Object.values(state.photos);
 
-  // Auto-select photo from array view or first available
   if (state._selectedPhotoId && state.photos[state._selectedPhotoId]) {
     _photoId = state._selectedPhotoId;
   } else if (photos.length > 0) {
@@ -60,15 +84,27 @@ export function render(container) {
   buildEditorUI();
 }
 
+export function destroy() {
+  document.removeEventListener('keydown', onKeyDown);
+}
+
+// ============================================================
+// UI construction
+// ============================================================
+
 function buildEditorUI() {
   const state = getState();
   const photo = state.photos[_photoId];
   if (!photo) return;
 
-  // Select first trace if none selected
+  _isFisheye = photo.projection === 'fisheye';
+
   if (!_traceName || !photo.traces[_traceName]) {
     _traceName = Object.keys(photo.traces)[0] || 'As-Is';
   }
+
+  const canvasW = _isFisheye ? 800 : 1200;
+  const canvasH = _isFisheye ? 800 : 600;
 
   _container.innerHTML = `
     <div class="fade-in">
@@ -83,43 +119,42 @@ function buildEditorUI() {
                 <option value="${p.id}" ${p.id === _photoId ? 'selected' : ''}>${esc(p.filename)}</option>
               `).join('')}
             </select>
-            ${photo.metadata.compassHeading != null ? `
-              <div style="margin-top:6px;font-size:11px;color:var(--gain)">
-                &#9737; Heading: ${photo.metadata.compassHeading.toFixed(1)}° (${photo.metadata.headingSource?.split('(')[0] || 'auto'})
-              </div>
-            ` : `
-              <div style="margin-top:6px">
-                <label style="font-size:10px;color:var(--text2);display:block;margin-bottom:3px">Compass Heading (°)</label>
-                <input type="number" id="inp-manual-heading" value="180" min="0" max="360" step="0.5"
-                  style="width:100%;background:var(--surface2);color:var(--warning);border:1px solid var(--border);border-radius:var(--radius-sm);padding:4px 8px;font-family:'JetBrains Mono',monospace;font-size:12px">
-                <span class="hint" style="color:var(--warning)">&#9888; No heading in metadata. Enter manually (180=South).</span>
-              </div>
-            `}
+            <div style="margin-top:4px;font-size:10px;color:var(--text3)">
+              ${_isFisheye ? '&#128065; Fisheye projection' : '&#127758; Equirectangular projection'}
+            </div>
           </div>
+
+          ${_isFisheye ? buildFisheyeOrientationUI(photo) : buildEquirectOrientationUI(photo)}
 
           <!-- Trace scenarios -->
           <div class="card" style="padding:12px">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-              <h2 style="margin:0">Traces</h2>
-              <button class="btn btn-sm" id="btn-add-trace">+ Add Scenario</button>
+              <h2 style="margin:0">Scenarios</h2>
+              <button class="btn btn-sm" id="btn-add-trace">+ Add</button>
             </div>
             <div class="trace-list" id="trace-list"></div>
           </div>
 
-          <!-- Drawing tools -->
+          <!-- Brush tools -->
           <div class="card" style="padding:12px">
-            <h2 style="margin-bottom:8px">Drawing Tools</h2>
+            <h2 style="margin-bottom:8px">Brush Tools</h2>
             <div style="display:flex;gap:4px;flex-wrap:wrap">
-              <button class="tool-btn ${_drawingMode === 'polyline' ? 'active' : ''}" data-mode="polyline" title="Click points to draw the obstruction boundary">
-                &#9998; Polyline
+              <button class="tool-btn ${_brushTool === 'ground' ? 'active' : ''}" data-tool="ground" title="Paint ground obstructions (G)">
+                &#9608; Ground
               </button>
-              <button class="tool-btn ${_drawingMode === 'freehand' ? 'active' : ''}" data-mode="freehand" title="Freehand draw the obstruction boundary">
-                &#9999; Freehand
+              <button class="tool-btn ${_brushTool === 'sky' ? 'active' : ''}" data-tool="sky" title="Erase — mark as sky (S)">
+                &#9675; Sky
               </button>
             </div>
-            <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px">
-              <button class="btn btn-sm" id="btn-undo-path" title="Undo last path">Undo</button>
-              <button class="btn btn-sm" id="btn-clear-trace" title="Clear all paths in current trace">Clear</button>
+            <div style="margin-top:8px">
+              <label style="font-size:10px;color:var(--text2);display:block;margin-bottom:2px">
+                Brush Size: <span id="lbl-brush-size">${_brushSize}</span>px
+              </label>
+              <input type="range" id="rng-brush-size" min="5" max="150" value="${_brushSize}" style="width:100%">
+            </div>
+            <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:8px">
+              <button class="btn btn-sm" id="btn-clear-mask" title="Clear all mask in current scenario">Clear</button>
+              <button class="btn btn-sm" id="btn-invert-mask" title="Invert mask: swap ground/sky">Invert</button>
             </div>
             <div style="margin-top:8px;display:flex;flex-direction:column;gap:4px">
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);cursor:pointer">
@@ -129,7 +164,7 @@ function buildEditorUI() {
                 <input type="checkbox" id="chk-grid" ${_showGrid ? 'checked' : ''} style="accent-color:var(--sun)"> Az/El grid
               </label>
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);cursor:pointer">
-                <input type="checkbox" id="chk-upper" ${_viewUpper ? 'checked' : ''} style="accent-color:var(--sun)"> Upper hemisphere only
+                <input type="checkbox" id="chk-mask" ${_showMask ? 'checked' : ''} style="accent-color:var(--sun)"> Show mask
               </label>
             </div>
           </div>
@@ -139,7 +174,7 @@ function buildEditorUI() {
             <h2 style="margin-bottom:8px">Derived Horizon Profile</h2>
             <canvas id="c-horizon-mini" width="260" height="80" style="width:100%"></canvas>
             <p class="hint" style="margin-top:4px">
-              Blue line = obstruction elevation at each azimuth. Derived from traced boundary.
+              Blue line = obstruction elevation derived from mask.
             </p>
           </div>
         </div>
@@ -147,47 +182,215 @@ function buildEditorUI() {
         <!-- MAIN CANVAS -->
         <div>
           <div class="editor-canvas-wrap" id="canvas-wrap">
-            <canvas id="c-editor" width="1200" height="600"></canvas>
+            <canvas id="c-editor" width="${canvasW}" height="${canvasH}"></canvas>
           </div>
           <p class="hint" style="margin-top:6px">
-            ${_drawingMode === 'polyline'
-              ? 'Click to place points along the obstruction boundary. Double-click or press Enter to finish a path. Press Escape to cancel.'
-              : 'Click and drag to draw the obstruction boundary freehand. Release to finish.'}
-            The area below the line is treated as shaded. Sun paths shown in yellow (unshaded) and red (blocked).
+            Paint obstructions (ground) on the photo. Switch between Ground (G) and Sky/Erase (S) tools.
+            Use scroll wheel or [ / ] to adjust brush size. Sun paths: yellow = clear, red = blocked.
           </p>
         </div>
       </div>
 
       <div style="text-align:center;margin-top:12px">
         <button class="btn btn-primary" id="btn-next-report" style="padding:10px 32px;font-size:14px">
-          Generate Report →
+          Generate Report &rarr;
         </button>
       </div>
     </div>
   `;
 
-  setupCanvas();
+  setupCanvas(photo);
   buildTraceList();
   bindEditorEvents();
+  loadMaskFromState();
   redraw();
 }
 
-// --- Canvas setup ---
+// ============================================================
+// Orientation UI builders
+// ============================================================
 
-function setupCanvas() {
+function buildFisheyeOrientationUI(photo) {
+  const state = getState();
+  const sys = state.system;
+  const fe = photo.fisheye || {};
+  const ori = photo.orientation || {};
+  const panelAz = ori.panelAzimuth ?? sys.azimuth;
+  const panelTilt = ori.panelTilt ?? sys.tilt;
+  const clockAngle = ori.clockAngle ?? fe.accelClockAngle ?? 0;
+
+  // Build reference rows info
+  const accelTilt = fe.accelTilt != null ? fe.accelTilt.toFixed(1) + '°' : '—';
+  const accelClk = fe.accelClockAngle != null ? fe.accelClockAngle.toFixed(1) + '°' : '—';
+
+  // Sun position from EXIF
+  let sunInfo = '';
+  if (photo.metadata?.dateTime && state.location.lat != null) {
+    const sp = sunPositionAtTime(photo.metadata.dateTime, state.location.lat, state.location.lon);
+    if (sp && sp.elevation > 0) {
+      sunInfo = `<div style="margin-top:4px;font-size:10px;color:var(--sun)">&#9788; Sun at capture: Az ${sp.azimuth.toFixed(1)}° El ${sp.elevation.toFixed(1)}°</div>`;
+    }
+  }
+
+  return `
+    <div class="card" style="padding:12px">
+      <h2 style="margin-bottom:8px">Orientation</h2>
+      <table style="width:100%;font-size:10px;color:var(--text2);border-collapse:collapse">
+        <tr><th style="text-align:left;padding:2px 4px"></th><th style="padding:2px 4px">Setup</th><th style="padding:2px 4px">Accel</th><th style="padding:2px 4px">Slider</th></tr>
+        <tr>
+          <td style="padding:2px 4px">Tilt</td>
+          <td style="text-align:center;padding:2px 4px">${sys.tilt}°</td>
+          <td style="text-align:center;padding:2px 4px">${accelTilt}</td>
+          <td style="text-align:center;padding:2px 4px"><span id="lbl-ori-tilt">${panelTilt}°</span></td>
+        </tr>
+        <tr>
+          <td style="padding:2px 4px">Azimuth</td>
+          <td style="text-align:center;padding:2px 4px">${sys.azimuth}°</td>
+          <td style="text-align:center;padding:2px 4px">—</td>
+          <td style="text-align:center;padding:2px 4px"><span id="lbl-ori-az">${panelAz}°</span></td>
+        </tr>
+        <tr>
+          <td style="padding:2px 4px">Clock</td>
+          <td style="text-align:center;padding:2px 4px">—</td>
+          <td style="text-align:center;padding:2px 4px">${accelClk}</td>
+          <td style="text-align:center;padding:2px 4px"><span id="lbl-ori-clk">${clockAngle.toFixed(1)}°</span></td>
+        </tr>
+      </table>
+      <div style="margin-top:8px">
+        <label style="font-size:10px;color:var(--text2)">Panel Azimuth</label>
+        <input type="range" id="rng-panel-az" min="0" max="360" step="0.5" value="${panelAz}" style="width:100%">
+      </div>
+      <div>
+        <label style="font-size:10px;color:var(--text2)">Panel Tilt</label>
+        <input type="range" id="rng-panel-tilt" min="0" max="90" step="0.5" value="${panelTilt}" style="width:100%">
+      </div>
+      <div>
+        <label style="font-size:10px;color:var(--text2)">Clock Angle</label>
+        <input type="range" id="rng-clock-angle" min="-180" max="180" step="0.5" value="${clockAngle}" style="width:100%">
+      </div>
+      ${sunInfo}
+    </div>
+  `;
+}
+
+function buildEquirectOrientationUI(photo) {
+  const heading = photo.metadata?.compassHeading;
+  if (heading != null) {
+    return `
+      <div class="card" style="padding:12px">
+        <div style="font-size:11px;color:var(--gain)">
+          &#9737; Heading: ${heading.toFixed(1)}° (${photo.metadata.headingSource?.split('(')[0] || 'auto'})
+        </div>
+      </div>
+    `;
+  }
+  return `
+    <div class="card" style="padding:12px">
+      <label style="font-size:10px;color:var(--text2);display:block;margin-bottom:3px">Compass Heading (°)</label>
+      <input type="number" id="inp-manual-heading" value="180" min="0" max="360" step="0.5"
+        style="width:100%;background:var(--surface2);color:var(--warning);border:1px solid var(--border);border-radius:var(--radius-sm);padding:4px 8px;font-family:'JetBrains Mono',monospace;font-size:12px">
+      <span class="hint" style="color:var(--warning)">&#9888; No heading in metadata. Enter manually (180=South).</span>
+    </div>
+  `;
+}
+
+// ============================================================
+// Canvas setup
+// ============================================================
+
+function setupCanvas(photo) {
   _canvas = qs('#c-editor', _container);
   _ctx = _canvas.getContext('2d');
+
+  const W = _canvas.width;
+  const H = _canvas.height;
+
+  // Create off-screen mask canvas (same dimensions as display)
+  _maskCanvas = document.createElement('canvas');
+  _maskCanvas.width = W;
+  _maskCanvas.height = H;
+  _maskCtx = _maskCanvas.getContext('2d');
+
+  // Build fisheye transform if needed
+  if (_isFisheye && photo.fisheye) {
+    const ori = photo.orientation || {};
+    const sys = getState().system;
+    _fov = photo.fisheye.fov || 90;
+    _worldToCamera = buildFisheyeRotation(
+      ori.panelAzimuth ?? sys.azimuth,
+      ori.panelTilt ?? sys.tilt,
+      ori.clockAngle ?? photo.fisheye.accelClockAngle ?? 0
+    );
+  }
 
   // Load the photo image
   _img = new Image();
   _img.onload = () => redraw();
-  _img.src = getState().photos[_photoId]?.dataUrl || '';
+  _img.src = photo.dataUrl || '';
 }
+
+// ============================================================
+// Mask load/save
+// ============================================================
+
+function loadMaskFromState() {
+  const photo = getState().photos[_photoId];
+  if (!photo) return;
+  const trace = photo.traces[_traceName];
+  if (!trace?.groundMask) return;
+
+  const img = new Image();
+  img.onload = () => {
+    _maskCtx.clearRect(0, 0, _maskCanvas.width, _maskCanvas.height);
+    _maskCtx.drawImage(img, 0, 0, _maskCanvas.width, _maskCanvas.height);
+    redraw();
+  };
+  img.src = trace.groundMask;
+}
+
+function saveMaskToState() {
+  const photo = getState().photos[_photoId];
+  if (!photo) return;
+  const trace = photo.traces[_traceName];
+  if (!trace) return;
+
+  // Check if mask has any content
+  const id = _maskCtx.getImageData(0, 0, _maskCanvas.width, _maskCanvas.height);
+  let hasContent = false;
+  for (let i = 3; i < id.data.length; i += 4) {
+    if (id.data[i] > 0) { hasContent = true; break; }
+  }
+
+  trace.groundMask = hasContent ? _maskCanvas.toDataURL('image/png') : null;
+  // Also derive legacy horizon for backwards compat
+  updateHorizonFromMask(trace);
+}
+
+const debouncedSave = debounce(saveMaskToState, 500);
+
+function updateHorizonFromMask(trace) {
+  if (!trace.groundMask) {
+    trace.horizonProfile = null;
+    return;
+  }
+  // Build lookup and derive 1D horizon
+  const photo = getState().photos[_photoId];
+  const sys = getState().system;
+  decodeMaskDataUrl(trace.groundMask).then(maskData => {
+    const lookup = buildSkyMaskLookup(photo, maskData, { azimuth: sys.azimuth, tilt: sys.tilt });
+    trace.horizonProfile = maskLookupToHorizon(lookup);
+    updateHorizonMini();
+  });
+}
+
+// ============================================================
+// Orientation helpers
+// ============================================================
 
 function getHeading() {
   const photo = getState().photos[_photoId];
   if (!photo) return 180;
-  if (photo.metadata.compassHeading != null) return photo.metadata.compassHeading;
+  if (photo.metadata?.compassHeading != null) return photo.metadata.compassHeading;
   const inp = qs('#inp-manual-heading', _container);
   return inp ? parseFloat(inp.value) || 180 : 180;
 }
@@ -196,36 +399,56 @@ function getPitch() {
   return getState().photos[_photoId]?.metadata?.pitch || 0;
 }
 
-// --- Coordinate conversion helpers (canvas pixel ↔ normalized ↔ sky) ---
-
-function canvasToNorm(cx, cy) {
-  const w = _canvas.width, h = _canvas.height;
-  if (_viewUpper) {
-    // Upper hemisphere only: canvas shows top half of equirectangular
-    return { x: cx / w, y: cy / h * 0.5 };
-  }
-  return { x: cx / w, y: cy / h };
+function getOrientation() {
+  const photo = getState().photos[_photoId];
+  if (!photo) return { panelAz: 180, panelTilt: 30, clockAngle: 0 };
+  const sys = getState().system;
+  const ori = photo.orientation || {};
+  const fe = photo.fisheye || {};
+  return {
+    panelAz: ori.panelAzimuth ?? sys.azimuth,
+    panelTilt: ori.panelTilt ?? sys.tilt,
+    clockAngle: ori.clockAngle ?? fe.accelClockAngle ?? 0,
+  };
 }
 
-function normToCanvas(nx, ny) {
-  const w = _canvas.width, h = _canvas.height;
-  if (_viewUpper) {
-    return { x: nx * w, y: (ny / 0.5) * h };
+function rebuildFisheyeTransform() {
+  const o = getOrientation();
+  const photo = getState().photos[_photoId];
+  _fov = photo?.fisheye?.fov || 90;
+  _worldToCamera = buildFisheyeRotation(o.panelAz, o.panelTilt, o.clockAngle);
+}
+
+// ============================================================
+// Coordinate conversion
+// ============================================================
+
+function skyToCanvas(az, el) {
+  if (_isFisheye) {
+    return skyToFisheye(az, el, _worldToCamera, Math.min(_canvas.width, _canvas.height), _fov);
   }
-  return { x: nx * w, y: ny * h };
+  // Equirect: upper hemisphere only (canvas height = half sphere)
+  const norm = skyToImage(az, el, getHeading(), getPitch());
+  return {
+    x: norm.x * _canvas.width,
+    y: (norm.y / 0.5) * _canvas.height,
+    visible: el >= 0 && norm.x >= 0 && norm.x <= 1,
+  };
 }
 
 function canvasToSky(cx, cy) {
-  const norm = canvasToNorm(cx, cy);
-  return imageToSky(norm.x, norm.y, getHeading(), getPitch());
+  if (_isFisheye) {
+    return fisheyeToSky(cx, cy, _worldToCamera, Math.min(_canvas.width, _canvas.height), _fov);
+  }
+  // Equirect upper hemisphere
+  const xN = cx / _canvas.width;
+  const yN = (cy / _canvas.height) * 0.5;
+  return imageToSky(xN, yN, getHeading(), getPitch());
 }
 
-function skyToCanvas(az, el) {
-  const norm = skyToImage(az, el, getHeading(), getPitch());
-  return normToCanvas(norm.x, norm.y);
-}
-
-// --- Drawing / Rendering ---
+// ============================================================
+// Drawing / rendering
+// ============================================================
 
 function redraw() {
   if (!_ctx || !_canvas) return;
@@ -235,116 +458,175 @@ function redraw() {
   const photo = getState().photos[_photoId];
   if (!photo) return;
 
-  // Draw photo as background
+  // Draw photo background
   if (_img && _img.complete && _img.naturalWidth > 0) {
-    if (_viewUpper) {
-      // Show only upper half (above horizon)
-      _ctx.drawImage(_img, 0, 0, _img.naturalWidth, _img.naturalHeight / 2, 0, 0, W, H);
-    } else {
+    if (_isFisheye) {
       _ctx.drawImage(_img, 0, 0, W, H);
+    } else {
+      // Upper hemisphere only
+      _ctx.drawImage(_img, 0, 0, _img.naturalWidth, _img.naturalHeight / 2, 0, 0, W, H);
     }
   } else {
-    // No image: dark background
     _ctx.fillStyle = '#1a2030';
     _ctx.fillRect(0, 0, W, H);
   }
 
-  // Draw compass grid
+  // Circular clip for fisheye
+  if (_isFisheye) {
+    _ctx.save();
+    _ctx.globalCompositeOperation = 'destination-in';
+    _ctx.beginPath();
+    _ctx.arc(W / 2, H / 2, W / 2, 0, Math.PI * 2);
+    _ctx.fill();
+    _ctx.restore();
+  }
+
+  // Draw mask overlay
+  if (_showMask) {
+    _ctx.save();
+    _ctx.globalAlpha = 0.35;
+    _ctx.drawImage(_maskCanvas, 0, 0);
+    _ctx.restore();
+  }
+
+  // Grid
   if (_showGrid) {
-    drawCompassGrid(W, H);
+    drawGrid(W, H);
   }
 
-  // Draw sun paths
+  // Sun paths
   if (_showSunPaths) {
-    drawSunPaths(W, H, photo);
+    drawSunPaths(W, H);
   }
 
-  // Draw all trace paths (dimmed for non-active traces)
-  for (const [name, trace] of Object.entries(photo.traces)) {
-    const isActive = name === _traceName;
-    drawTracePaths(trace.paths, trace.color, isActive ? 1.0 : 0.3, isActive ? 2.5 : 1);
+  // Brush cursor
+  if (_lastPaintPos) {
+    _ctx.save();
+    _ctx.strokeStyle = _brushTool === 'ground' ? 'rgba(230,80,80,0.7)' : 'rgba(80,180,230,0.7)';
+    _ctx.lineWidth = 1.5;
+    _ctx.beginPath();
+    _ctx.arc(_lastPaintPos.x, _lastPaintPos.y, _brushSize / 2, 0, Math.PI * 2);
+    _ctx.stroke();
+    _ctx.restore();
   }
 
-  // Draw current in-progress path
-  if (_currentPath.length > 0) {
-    drawInProgressPath();
-  }
-
-  // Draw horizon line for current trace
-  const trace = photo.traces[_traceName];
-  if (trace?.horizonProfile) {
-    drawHorizonLine(trace.horizonProfile);
-  }
-
-  // Update mini horizon chart
   updateHorizonMini();
 }
 
-function drawCompassGrid(W, H) {
-  const heading = getHeading();
-  const pitch = getPitch();
-
+function drawGrid(W, H) {
   _ctx.save();
-  _ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-  _ctx.lineWidth = 0.5;
   _ctx.font = '10px "JetBrains Mono", monospace';
 
-  const cardinals = { 0: 'N', 45: 'NE', 90: 'E', 135: 'SE', 180: 'S', 225: 'SW', 270: 'W', 315: 'NW' };
+  if (_isFisheye) {
+    // Elevation rings
+    for (let el = 10; el <= 80; el += 10) {
+      _ctx.beginPath();
+      _ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+      _ctx.lineWidth = 0.5;
+      const pts = [];
+      for (let az = 0; az < 360; az += 2) {
+        const p = skyToCanvas(az, el);
+        if (p.visible) pts.push(p);
+      }
+      if (pts.length > 2) {
+        _ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) _ctx.lineTo(pts[i].x, pts[i].y);
+        _ctx.closePath();
+      }
+      _ctx.stroke();
 
-  // Elevation lines
-  const maxEl = _viewUpper ? 90 : 90;
-  const minEl = _viewUpper ? 0 : -90;
-  for (let elev = 0; elev <= maxEl; elev += 10) {
-    const cp = skyToCanvas(heading, elev);
-    if (cp.y < 0 || cp.y > H) continue;
-    _ctx.beginPath();
-    _ctx.moveTo(0, cp.y);
-    _ctx.lineTo(W, cp.y);
-    _ctx.stroke();
-    _ctx.fillStyle = 'rgba(255,255,255,0.3)';
-    _ctx.textAlign = 'left';
-    _ctx.fillText(`${elev}°`, 4, cp.y - 2);
-  }
+      // Label
+      if (el % 30 === 0) {
+        const lp = skyToCanvas(0, el);
+        if (lp.visible) {
+          _ctx.fillStyle = 'rgba(255,255,255,0.3)';
+          _ctx.textAlign = 'center';
+          _ctx.fillText(`${el}°`, lp.x, lp.y - 3);
+        }
+      }
+    }
 
-  // Horizon line emphasis
-  const hp = skyToCanvas(heading, 0);
-  if (hp.y >= 0 && hp.y <= H) {
-    _ctx.beginPath();
-    _ctx.moveTo(0, hp.y);
-    _ctx.lineTo(W, hp.y);
-    _ctx.strokeStyle = 'rgba(255,200,0,0.4)';
-    _ctx.lineWidth = 2;
-    _ctx.stroke();
+    // Azimuth radials
+    const cardinals = { 0: 'N', 90: 'E', 180: 'S', 270: 'W' };
+    for (let az = 0; az < 360; az += 30) {
+      const p0 = skyToCanvas(az, 0);
+      const p1 = skyToCanvas(az, 85);
+      if (p0.visible && p1.visible) {
+        _ctx.beginPath();
+        _ctx.moveTo(p0.x, p0.y);
+        _ctx.lineTo(p1.x, p1.y);
+        _ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+        _ctx.lineWidth = 0.5;
+        _ctx.stroke();
+      }
+      const label = cardinals[az] || `${az}°`;
+      const lp = skyToCanvas(az, 2);
+      if (lp.visible) {
+        _ctx.fillStyle = cardinals[az] ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.25)';
+        _ctx.textAlign = 'center';
+        _ctx.fillText(label, lp.x, lp.y + 12);
+      }
+    }
+  } else {
+    // Equirectangular grid (same as original)
+    const heading = getHeading();
     _ctx.strokeStyle = 'rgba(255,255,255,0.12)';
     _ctx.lineWidth = 0.5;
-  }
 
-  // Azimuth lines
-  for (let az = 0; az < 360; az += 30) {
-    const cp = skyToCanvas(az, 45);
-    if (cp.x < 0 || cp.x > W) continue;
-    _ctx.beginPath();
-    _ctx.moveTo(cp.x, 0);
-    _ctx.lineTo(cp.x, H);
-    _ctx.stroke();
+    // Elevation lines
+    for (let elev = 0; elev <= 90; elev += 10) {
+      const cp = skyToCanvas(heading, elev);
+      if (cp.y < 0 || cp.y > H) continue;
+      _ctx.beginPath();
+      _ctx.moveTo(0, cp.y);
+      _ctx.lineTo(W, cp.y);
+      _ctx.stroke();
+      _ctx.fillStyle = 'rgba(255,255,255,0.3)';
+      _ctx.textAlign = 'left';
+      _ctx.fillText(`${elev}°`, 4, cp.y - 2);
+    }
 
-    const label = cardinals[az] || `${az}°`;
-    _ctx.fillStyle = cardinals[az] ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.25)';
-    _ctx.textAlign = 'center';
-    _ctx.fillText(label, cp.x, H - 4);
+    // Horizon emphasis
+    const hp = skyToCanvas(heading, 0);
+    if (hp.y >= 0 && hp.y <= H) {
+      _ctx.beginPath();
+      _ctx.moveTo(0, hp.y);
+      _ctx.lineTo(W, hp.y);
+      _ctx.strokeStyle = 'rgba(255,200,0,0.4)';
+      _ctx.lineWidth = 2;
+      _ctx.stroke();
+      _ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+      _ctx.lineWidth = 0.5;
+    }
+
+    // Azimuth lines
+    const cardinals = { 0: 'N', 45: 'NE', 90: 'E', 135: 'SE', 180: 'S', 225: 'SW', 270: 'W', 315: 'NW' };
+    for (let az = 0; az < 360; az += 30) {
+      const cp = skyToCanvas(az, 45);
+      if (cp.x < 0 || cp.x > W) continue;
+      _ctx.beginPath();
+      _ctx.moveTo(cp.x, 0);
+      _ctx.lineTo(cp.x, H);
+      _ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+      _ctx.lineWidth = 0.5;
+      _ctx.stroke();
+      const label = cardinals[az] || `${az}°`;
+      _ctx.fillStyle = cardinals[az] ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.25)';
+      _ctx.textAlign = 'center';
+      _ctx.fillText(label, cp.x, H - 4);
+    }
   }
 
   _ctx.restore();
 }
 
-function drawSunPaths(W, H, photo) {
+function drawSunPaths(W, H) {
   const state = getState();
   const lat = state.location.lat;
   if (lat == null) return;
 
-  // Get horizon profile for shading detection
-  const trace = photo.traces[_traceName];
-  const horizon = trace?.horizonProfile || new Float32Array(360);
+  // Get mask data for shading detection
+  const maskId = _maskCtx.getImageData(0, 0, _maskCanvas.width, _maskCanvas.height);
 
   const allPaths = computeAllSunPaths(lat);
   const monthAlpha = ['44', '55', '77', '88', 'aa', 'cc', 'cc', 'aa', '88', '77', '55', '44'];
@@ -357,12 +639,14 @@ function drawSunPaths(W, H, photo) {
       const c0 = skyToCanvas(p0.azimuth, p0.elevation);
       const c1 = skyToCanvas(p1.azimuth, p1.elevation);
 
+      if (!c0.visible && !c1.visible) continue;
       if (c0.x < -50 || c0.x > W + 50 || c1.x < -50 || c1.x > W + 50) continue;
       if (c0.y < -50 || c0.y > H + 50 || c1.y < -50 || c1.y > H + 50) continue;
 
-      const az0 = Math.round(p0.azimuth) % 360;
-      const az1 = Math.round(p1.azimuth) % 360;
-      const sh = p0.elevation <= horizon[az0] || p1.elevation <= horizon[az1];
+      // Check mask at these positions for shade coloring
+      const sh0 = isMaskPixelGround(maskId, Math.round(c0.x), Math.round(c0.y));
+      const sh1 = isMaskPixelGround(maskId, Math.round(c1.x), Math.round(c1.y));
+      const sh = sh0 || sh1;
 
       _ctx.beginPath();
       _ctx.moveTo(c0.x, c0.y);
@@ -372,112 +656,43 @@ function drawSunPaths(W, H, photo) {
       _ctx.stroke();
     }
   }
-  _ctx.restore();
-}
 
-function drawTracePaths(paths, color, alpha, lineWidth) {
-  if (!paths || paths.length === 0) return;
-  _ctx.save();
-  _ctx.globalAlpha = alpha;
-
-  for (const path of paths) {
-    if (path.points.length < 2) continue;
-
-    // Draw the path line
-    _ctx.beginPath();
-    for (let i = 0; i < path.points.length; i++) {
-      const cp = normToCanvas(path.points[i].x, path.points[i].y);
-      if (i === 0) _ctx.moveTo(cp.x, cp.y);
-      else _ctx.lineTo(cp.x, cp.y);
-    }
-    _ctx.strokeStyle = color;
-    _ctx.lineWidth = lineWidth;
-    _ctx.stroke();
-
-    // Fill below the line (shade area)
-    _ctx.lineTo(normToCanvas(path.points[path.points.length - 1].x, _viewUpper ? 0.5 : 1).x,
-                normToCanvas(0, _viewUpper ? 0.5 : 1).y);
-    _ctx.lineTo(normToCanvas(path.points[0].x, _viewUpper ? 0.5 : 1).x,
-                normToCanvas(0, _viewUpper ? 0.5 : 1).y);
-    _ctx.closePath();
-    _ctx.fillStyle = color.replace(')', ',0.08)').replace('rgb', 'rgba');
-    if (color.startsWith('#')) {
-      _ctx.fillStyle = color + '14';
-    }
-    _ctx.fill();
-
-    // Points
-    for (const pt of path.points) {
-      const cp = normToCanvas(pt.x, pt.y);
-      _ctx.beginPath();
-      _ctx.arc(cp.x, cp.y, 3, 0, Math.PI * 2);
-      _ctx.fillStyle = color;
-      _ctx.fill();
+  // Draw current sun position icon if fisheye with EXIF time
+  if (_isFisheye) {
+    const photo = getState().photos[_photoId];
+    if (photo?.metadata?.dateTime && lat != null) {
+      const sp = sunPositionAtTime(photo.metadata.dateTime, lat, state.location.lon);
+      if (sp && sp.elevation > 0) {
+        const sc = skyToCanvas(sp.azimuth, sp.elevation);
+        if (sc.visible) {
+          _ctx.beginPath();
+          _ctx.arc(sc.x, sc.y, 8, 0, Math.PI * 2);
+          _ctx.fillStyle = '#f5c842';
+          _ctx.fill();
+          _ctx.strokeStyle = '#000';
+          _ctx.lineWidth = 1.5;
+          _ctx.stroke();
+          _ctx.fillStyle = '#000';
+          _ctx.font = 'bold 10px sans-serif';
+          _ctx.textAlign = 'center';
+          _ctx.textBaseline = 'middle';
+          _ctx.fillText('☀', sc.x, sc.y);
+        }
+      }
     }
   }
 
   _ctx.restore();
 }
 
-function drawInProgressPath() {
-  if (_currentPath.length === 0) return;
-  _ctx.save();
-
-  const photo = getState().photos[_photoId];
-  const trace = photo?.traces[_traceName];
-  const color = trace?.color || '#3b82f6';
-
-  _ctx.beginPath();
-  for (let i = 0; i < _currentPath.length; i++) {
-    const cp = normToCanvas(_currentPath[i].x, _currentPath[i].y);
-    if (i === 0) _ctx.moveTo(cp.x, cp.y);
-    else _ctx.lineTo(cp.x, cp.y);
-  }
-  _ctx.strokeStyle = color;
-  _ctx.lineWidth = 2.5;
-  _ctx.setLineDash([6, 3]);
-  _ctx.stroke();
-  _ctx.setLineDash([]);
-
-  // Points
-  for (const pt of _currentPath) {
-    const cp = normToCanvas(pt.x, pt.y);
-    _ctx.beginPath();
-    _ctx.arc(cp.x, cp.y, 4, 0, Math.PI * 2);
-    _ctx.fillStyle = '#fff';
-    _ctx.fill();
-    _ctx.beginPath();
-    _ctx.arc(cp.x, cp.y, 2.5, 0, Math.PI * 2);
-    _ctx.fillStyle = color;
-    _ctx.fill();
-  }
-
-  _ctx.restore();
+function isMaskPixelGround(maskId, x, y) {
+  if (x < 0 || x >= maskId.width || y < 0 || y >= maskId.height) return false;
+  return maskId.data[(y * maskId.width + x) * 4 + 3] > 128;
 }
 
-function drawHorizonLine(profile) {
-  if (!profile) return;
-  _ctx.save();
-  _ctx.strokeStyle = 'rgba(59,130,246,0.6)';
-  _ctx.lineWidth = 1.5;
-  _ctx.setLineDash([4, 2]);
-  _ctx.beginPath();
-
-  let started = false;
-  for (let az = 0; az < 360; az++) {
-    const el = profile[az];
-    if (el <= 0) continue;
-    const cp = skyToCanvas(az, el);
-    if (cp.x < 0 || cp.x > _canvas.width) continue;
-    if (!started) { _ctx.moveTo(cp.x, cp.y); started = true; }
-    else _ctx.lineTo(cp.x, cp.y);
-  }
-  _ctx.stroke();
-  _ctx.setLineDash([]);
-  _ctx.restore();
-}
-
-// --- Horizon mini chart ---
+// ============================================================
+// Horizon mini-chart
+// ============================================================
 
 function updateHorizonMini() {
   const miniCanvas = qs('#c-horizon-mini', _container);
@@ -489,15 +704,15 @@ function updateHorizonMini() {
   const photo = getState().photos[_photoId];
   const trace = photo?.traces[_traceName];
   const profile = trace?.horizonProfile;
+
   if (!profile) {
     mc.fillStyle = '#546e7a';
     mc.font = '10px "JetBrains Mono"';
     mc.textAlign = 'center';
-    mc.fillText('No trace drawn yet', W / 2, H / 2 + 4);
+    mc.fillText('No mask painted yet', W / 2, H / 2 + 4);
     return;
   }
 
-  // Draw profile
   const maxEl = Math.max(1, ...profile);
   mc.fillStyle = '#3b82f618';
   mc.strokeStyle = '#3b82f6';
@@ -521,7 +736,6 @@ function updateHorizonMini() {
   }
   mc.stroke();
 
-  // Labels
   mc.fillStyle = '#546e7a';
   mc.font = '8px "JetBrains Mono"';
   mc.textAlign = 'center';
@@ -531,7 +745,40 @@ function updateHorizonMini() {
   }
 }
 
-// --- Trace list ---
+// ============================================================
+// Painting
+// ============================================================
+
+function paintAt(cx, cy) {
+  const r = _brushSize / 2;
+  if (_brushTool === 'ground') {
+    _maskCtx.fillStyle = 'rgba(230, 60, 60, 0.85)';
+    _maskCtx.beginPath();
+    _maskCtx.arc(cx, cy, r, 0, Math.PI * 2);
+    _maskCtx.fill();
+  } else {
+    _maskCtx.save();
+    _maskCtx.globalCompositeOperation = 'destination-out';
+    _maskCtx.beginPath();
+    _maskCtx.arc(cx, cy, r, 0, Math.PI * 2);
+    _maskCtx.fill();
+    _maskCtx.restore();
+  }
+}
+
+function paintLine(x0, y0, x1, y1) {
+  const dx = x1 - x0, dy = y1 - y0;
+  const dist = Math.hypot(dx, dy);
+  const steps = Math.max(1, Math.ceil(dist / (_brushSize * 0.3)));
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    paintAt(x0 + dx * t, y0 + dy * t);
+  }
+}
+
+// ============================================================
+// Trace list
+// ============================================================
 
 function buildTraceList() {
   const list = qs('#trace-list', _container);
@@ -545,10 +792,11 @@ function buildTraceList() {
     const item = el('div', {
       class: `trace-item ${name === _traceName ? 'active' : ''}`,
     });
+    const hasMask = trace.groundMask ? '&#9632;' : '&#9633;';
     item.innerHTML = `
       <span class="trace-color" style="background:${trace.color}"></span>
       <span class="trace-name">${esc(name)} ${trace.isDefault ? '(default)' : ''}</span>
-      <span style="font-size:10px;color:var(--text3)">${trace.paths.length} path(s)</span>
+      <span style="font-size:10px;color:var(--text3)">${hasMask} mask</span>
       ${!trace.isDefault ? `<button class="btn btn-sm btn-ghost btn-danger" data-del="${name}" title="Delete trace" style="padding:2px 6px">&#10005;</button>` : ''}
     `;
     item.addEventListener('click', (e) => {
@@ -558,33 +806,61 @@ function buildTraceList() {
           _traceName = Object.keys(photo.traces)[0];
         }
         buildTraceList();
+        loadMaskFromState();
         redraw();
         return;
       }
+      // Save current mask before switching
+      saveMaskToState();
       _traceName = name;
       buildTraceList();
+      loadMaskFromState();
       redraw();
     });
     list.appendChild(item);
   }
 }
 
-// --- Event binding ---
+// ============================================================
+// Event binding
+// ============================================================
 
 function bindEditorEvents() {
   // Photo selector
   qs('#sel-photo', _container)?.addEventListener('change', (e) => {
+    saveMaskToState();
     _photoId = e.target.value;
     _traceName = null;
-    _currentPath = [];
     buildEditorUI();
   });
 
-  // Manual heading input
-  qs('#inp-manual-heading', _container)?.addEventListener('change', () => {
-    recomputeHorizons();
-    redraw();
-  });
+  // Manual heading
+  qs('#inp-manual-heading', _container)?.addEventListener('change', () => redraw());
+
+  // Fisheye orientation sliders
+  for (const id of ['rng-panel-az', 'rng-panel-tilt', 'rng-clock-angle']) {
+    qs(`#${id}`, _container)?.addEventListener('input', (e) => {
+      const photo = getState().photos[_photoId];
+      if (!photo) return;
+      if (!photo.orientation) photo.orientation = {};
+      const v = parseFloat(e.target.value);
+      if (id === 'rng-panel-az') {
+        photo.orientation.panelAzimuth = v;
+        const lbl = qs('#lbl-ori-az', _container);
+        if (lbl) lbl.textContent = v + '°';
+      } else if (id === 'rng-panel-tilt') {
+        photo.orientation.panelTilt = v;
+        const lbl = qs('#lbl-ori-tilt', _container);
+        if (lbl) lbl.textContent = v + '°';
+      } else {
+        photo.orientation.clockAngle = v;
+        const lbl = qs('#lbl-ori-clk', _container);
+        if (lbl) lbl.textContent = v.toFixed(1) + '°';
+      }
+      rebuildFisheyeTransform();
+      redraw();
+    });
+  }
 
   // Add trace
   qs('#btn-add-trace', _container)?.addEventListener('click', () => {
@@ -592,41 +868,50 @@ function bindEditorEvents() {
     if (!name || !name.trim()) return;
     addTrace(_photoId, name.trim());
     _traceName = name.trim();
+    _maskCtx.clearRect(0, 0, _maskCanvas.width, _maskCanvas.height);
     buildTraceList();
     redraw();
   });
 
-  // Drawing tools
-  for (const btn of qsa('.tool-btn[data-mode]', _container)) {
+  // Brush tool buttons
+  for (const btn of qsa('.tool-btn[data-tool]', _container)) {
     btn.addEventListener('click', () => {
-      _drawingMode = btn.dataset.mode;
-      qsa('.tool-btn[data-mode]', _container).forEach(b => b.classList.remove('active'));
+      _brushTool = btn.dataset.tool;
+      qsa('.tool-btn[data-tool]', _container).forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
-      _currentPath = [];
-      redraw();
     });
   }
 
-  // Undo
-  qs('#btn-undo-path', _container)?.addEventListener('click', () => {
-    const photo = getState().photos[_photoId];
-    const trace = photo?.traces[_traceName];
-    if (trace && trace.paths.length > 0) {
-      trace.paths.pop();
-      recomputeHorizons();
-      redraw();
-    }
+  // Brush size slider
+  qs('#rng-brush-size', _container)?.addEventListener('input', (e) => {
+    _brushSize = parseInt(e.target.value, 10);
+    qs('#lbl-brush-size', _container).textContent = _brushSize;
   });
 
-  // Clear trace
-  qs('#btn-clear-trace', _container)?.addEventListener('click', () => {
-    const photo = getState().photos[_photoId];
-    const trace = photo?.traces[_traceName];
-    if (trace) {
-      trace.paths = [];
-      trace.horizonProfile = null;
-      redraw();
+  // Clear mask
+  qs('#btn-clear-mask', _container)?.addEventListener('click', () => {
+    _maskCtx.clearRect(0, 0, _maskCanvas.width, _maskCanvas.height);
+    saveMaskToState();
+    redraw();
+  });
+
+  // Invert mask
+  qs('#btn-invert-mask', _container)?.addEventListener('click', () => {
+    const W = _maskCanvas.width, H = _maskCanvas.height;
+    const id = _maskCtx.getImageData(0, 0, W, H);
+    for (let i = 0; i < id.data.length; i += 4) {
+      if (id.data[i + 3] > 128) {
+        id.data[i + 3] = 0;
+      } else {
+        id.data[i] = 230;
+        id.data[i + 1] = 60;
+        id.data[i + 2] = 60;
+        id.data[i + 3] = 217;
+      }
     }
+    _maskCtx.putImageData(id, 0, 0);
+    saveMaskToState();
+    redraw();
   });
 
   // Overlay toggles
@@ -638,17 +923,17 @@ function bindEditorEvents() {
     _showGrid = e.target.checked;
     redraw();
   });
-  qs('#chk-upper', _container)?.addEventListener('change', (e) => {
-    _viewUpper = e.target.checked;
-    _canvas.height = _viewUpper ? 600 : 1200;
+  qs('#chk-mask', _container)?.addEventListener('change', (e) => {
+    _showMask = e.target.checked;
     redraw();
   });
 
-  // Canvas drawing events
+  // Canvas paint events
   bindCanvasEvents();
 
   // Next button
   qs('#btn-next-report', _container)?.addEventListener('click', () => {
+    saveMaskToState();
     document.querySelector('[data-view="report"]').click();
   });
 
@@ -669,161 +954,124 @@ function bindCanvasEvents() {
     };
   };
 
-  if (_drawingMode === 'polyline') {
-    _canvas.addEventListener('click', (e) => {
-      const { cx, cy } = getPos(e);
-      const norm = canvasToNorm(cx, cy);
-      _currentPath.push(norm);
-      redraw();
-    });
-
-    _canvas.addEventListener('dblclick', (e) => {
-      e.preventDefault();
-      finishPath();
-    });
-  }
-
-  // Freehand mode
   _canvas.addEventListener('mousedown', (e) => {
-    if (_drawingMode !== 'freehand') return;
     e.preventDefault();
-    _isDrawing = true;
-    _currentPath = [];
+    _isPainting = true;
     const { cx, cy } = getPos(e);
-    _currentPath.push(canvasToNorm(cx, cy));
+    paintAt(cx, cy);
+    _lastPaintPos = { x: cx, y: cy };
+    redraw();
   });
 
   _canvas.addEventListener('mousemove', (e) => {
-    if (!_isDrawing || _drawingMode !== 'freehand') return;
     const { cx, cy } = getPos(e);
-    const norm = canvasToNorm(cx, cy);
-    // Downsample: only add if moved enough
-    const last = _currentPath[_currentPath.length - 1];
-    const dist = Math.hypot(norm.x - last.x, norm.y - last.y);
-    if (dist > 0.003) {
-      _currentPath.push(norm);
+
+    if (_isPainting && _lastPaintPos) {
+      paintLine(_lastPaintPos.x, _lastPaintPos.y, cx, cy);
+      _lastPaintPos = { x: cx, y: cy };
+      redraw();
+    } else {
+      _lastPaintPos = { x: cx, y: cy };
+      // Show sky coords in title
+      const sky = canvasToSky(cx, cy);
+      if (sky && sky.valid !== false) {
+        _canvas.title = `Az: ${(sky.azimuth ?? 0).toFixed(1)}° El: ${(sky.elevation ?? 0).toFixed(1)}°`;
+      }
+      // Redraw to update cursor circle
       redraw();
     }
   });
 
   _canvas.addEventListener('mouseup', () => {
-    if (_isDrawing && _drawingMode === 'freehand') {
-      _isDrawing = false;
-      finishPath();
+    if (_isPainting) {
+      _isPainting = false;
+      debouncedSave();
     }
   });
 
   _canvas.addEventListener('mouseleave', () => {
-    if (_isDrawing && _drawingMode === 'freehand') {
-      _isDrawing = false;
-      finishPath();
+    if (_isPainting) {
+      _isPainting = false;
+      debouncedSave();
     }
+    _lastPaintPos = null;
+    redraw();
   });
+
+  // Scroll wheel = brush size
+  _canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    _brushSize = Math.max(5, Math.min(150, _brushSize + (e.deltaY > 0 ? -3 : 3)));
+    const slider = qs('#rng-brush-size', _container);
+    if (slider) slider.value = _brushSize;
+    const lbl = qs('#lbl-brush-size', _container);
+    if (lbl) lbl.textContent = _brushSize;
+    redraw();
+  }, { passive: false });
 
   // Touch support
   _canvas.addEventListener('touchstart', (e) => {
     e.preventDefault();
-    if (_drawingMode === 'freehand') {
-      _isDrawing = true;
-      _currentPath = [];
-      const touch = e.touches[0];
-      const rect = _canvas.getBoundingClientRect();
-      const cx = (touch.clientX - rect.left) * (_canvas.width / rect.width);
-      const cy = (touch.clientY - rect.top) * (_canvas.height / rect.height);
-      _currentPath.push(canvasToNorm(cx, cy));
-    } else {
-      const touch = e.touches[0];
-      const rect = _canvas.getBoundingClientRect();
-      const cx = (touch.clientX - rect.left) * (_canvas.width / rect.width);
-      const cy = (touch.clientY - rect.top) * (_canvas.height / rect.height);
-      _currentPath.push(canvasToNorm(cx, cy));
-      redraw();
-    }
-  }, { passive: false });
-
-  _canvas.addEventListener('touchmove', (e) => {
-    e.preventDefault();
-    if (_drawingMode !== 'freehand' || !_isDrawing) return;
+    _isPainting = true;
     const touch = e.touches[0];
     const rect = _canvas.getBoundingClientRect();
     const cx = (touch.clientX - rect.left) * (_canvas.width / rect.width);
     const cy = (touch.clientY - rect.top) * (_canvas.height / rect.height);
-    const norm = canvasToNorm(cx, cy);
-    const last = _currentPath[_currentPath.length - 1];
-    if (Math.hypot(norm.x - last.x, norm.y - last.y) > 0.003) {
-      _currentPath.push(norm);
-      redraw();
+    paintAt(cx, cy);
+    _lastPaintPos = { x: cx, y: cy };
+    redraw();
+  }, { passive: false });
+
+  _canvas.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    if (!_isPainting) return;
+    const touch = e.touches[0];
+    const rect = _canvas.getBoundingClientRect();
+    const cx = (touch.clientX - rect.left) * (_canvas.width / rect.width);
+    const cy = (touch.clientY - rect.top) * (_canvas.height / rect.height);
+    if (_lastPaintPos) {
+      paintLine(_lastPaintPos.x, _lastPaintPos.y, cx, cy);
     }
+    _lastPaintPos = { x: cx, y: cy };
+    redraw();
   }, { passive: false });
 
   _canvas.addEventListener('touchend', (e) => {
     e.preventDefault();
-    if (_isDrawing && _drawingMode === 'freehand') {
-      _isDrawing = false;
-      finishPath();
-    }
+    _isPainting = false;
+    debouncedSave();
   }, { passive: false });
-
-  // Show cursor position as sky coordinates
-  _canvas.addEventListener('mousemove', (e) => {
-    const { cx, cy } = getPos(e);
-    const sky = canvasToSky(cx, cy);
-    _canvas.title = `Az: ${sky.azimuth.toFixed(1)}°  El: ${sky.elevation.toFixed(1)}°`;
-  });
-}
-
-function finishPath() {
-  if (_currentPath.length < 2) {
-    _currentPath = [];
-    redraw();
-    return;
-  }
-
-  const photo = getState().photos[_photoId];
-  const trace = photo?.traces[_traceName];
-  if (!trace) return;
-
-  trace.paths.push({ points: [..._currentPath] });
-  _currentPath = [];
-  recomputeHorizons();
-  redraw();
-  buildTraceList();
-}
-
-function recomputeHorizons() {
-  const photo = getState().photos[_photoId];
-  if (!photo) return;
-  const heading = getHeading();
-  const pitch = getPitch();
-
-  for (const trace of Object.values(photo.traces)) {
-    if (trace.paths.length > 0) {
-      trace.horizonProfile = pathsToHorizon(trace.paths, heading, pitch);
-    } else {
-      trace.horizonProfile = null;
-    }
-  }
 }
 
 function onKeyDown(e) {
-  if (e.key === 'Enter') {
-    finishPath();
-  } else if (e.key === 'Escape') {
-    _currentPath = [];
+  // G = ground tool, S = sky tool
+  if (e.key === 'g' || e.key === 'G') {
+    _brushTool = 'ground';
+    qsa('.tool-btn[data-tool]', _container).forEach(b =>
+      b.classList.toggle('active', b.dataset.tool === 'ground')
+    );
+  } else if (e.key === 's' || e.key === 'S') {
+    _brushTool = 'sky';
+    qsa('.tool-btn[data-tool]', _container).forEach(b =>
+      b.classList.toggle('active', b.dataset.tool === 'sky')
+    );
+  } else if (e.key === '[') {
+    _brushSize = Math.max(5, _brushSize - 5);
+    const slider = qs('#rng-brush-size', _container);
+    if (slider) slider.value = _brushSize;
+    const lbl = qs('#lbl-brush-size', _container);
+    if (lbl) lbl.textContent = _brushSize;
     redraw();
-  } else if (e.key === 'z' && (e.ctrlKey || e.metaKey)) {
-    // Undo last point in current path
-    if (_currentPath.length > 0) {
-      _currentPath.pop();
-      redraw();
-    }
+  } else if (e.key === ']') {
+    _brushSize = Math.min(150, _brushSize + 5);
+    const slider = qs('#rng-brush-size', _container);
+    if (slider) slider.value = _brushSize;
+    const lbl = qs('#lbl-brush-size', _container);
+    if (lbl) lbl.textContent = _brushSize;
+    redraw();
   }
 }
 
 function esc(s) {
   return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
-}
-
-export function destroy() {
-  document.removeEventListener('keydown', onKeyDown);
 }

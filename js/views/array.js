@@ -11,7 +11,8 @@ import {
   moveMeasurementPoint, renameMeasurementPoint
 } from '../state.js';
 import {
-  el, qs, qsa, clearEl, parsePhotoMetadata, loadImage, fmtLatLon, fmtDeg
+  el, qs, qsa, clearEl, parsePhotoMetadata, loadImage, fmtLatLon, fmtDeg,
+  isInspFile, loadInspHalves, accelToOrientation
 } from '../utils.js';
 
 // ─── Constants ────────────────────────────────────────
@@ -108,7 +109,7 @@ function buildUI() {
               <div style="font-size:16px;opacity:0.4">&#128247;</div>
               <div class="upload-text" style="font-size:10px">Upload photos</div>
             </div>
-            <input type="file" id="file-photo-input" accept="image/*" multiple style="display:none">
+            <input type="file" id="file-photo-input" accept="image/*,.insp" multiple style="display:none">
             <div id="photo-list" style="display:flex;flex-direction:column;gap:6px;overflow-y:auto;flex:1;max-height:360px"></div>
           </div>
           <!-- RIGHT: Point Detail -->
@@ -757,6 +758,10 @@ function updatePointCoords() {
 
 async function handleFiles(files) {
   for (const file of files) {
+    if (isInspFile(file)) {
+      await processInspFile(file, false);
+      continue;
+    }
     if (!file.type.startsWith('image/')) continue;
     await processFile(file, false);
   }
@@ -766,6 +771,10 @@ async function handleFiles(files) {
 
 async function handleFilesForPoint(files) {
   for (const file of files) {
+    if (isInspFile(file)) {
+      await processInspFile(file, true);
+      continue;
+    }
     if (!file.type.startsWith('image/')) continue;
     await processFile(file, true);
   }
@@ -797,6 +806,153 @@ async function processFile(file, assignToSelected) {
   } catch (err) {
     console.error('Error processing photo:', err);
   }
+}
+
+/**
+ * Process an Insta360 INSP dual-fisheye file.
+ * Shows a modal for the user to select the sky-facing half,
+ * then stores it directly as a fisheye photo for the editor.
+ */
+async function processInspFile(file, assignToSelected) {
+  try {
+    const halves = await loadInspHalves(file);
+    const selectedHalf = await showInspHalfSelector(halves, file.name);
+    if (!selectedHalf) return; // user cancelled
+
+    // Determine lens calibration for the selected half
+    const cal = halves.calibration;
+    const lens = cal ? (selectedHalf.side === 'left' ? cal.lens1 : cal.lens2) : null;
+    const fov = lens?.fov || 90;
+
+    // Derive tilt/clock-angle from accelerometer if available
+    const accelOri = accelToOrientation(halves.accel);
+
+    // Get the fisheye image as a data URL (downscale to ~1500px for perf)
+    const srcCanvas = selectedHalf.canvas;
+    const maxDim = 1500;
+    const scale = Math.min(1, maxDim / Math.max(srcCanvas.width, srcCanvas.height));
+    const outW = Math.round(srcCanvas.width * scale);
+    const outH = Math.round(srcCanvas.height * scale);
+    const outCanvas = document.createElement('canvas');
+    outCanvas.width = outW;
+    outCanvas.height = outH;
+    outCanvas.getContext('2d').drawImage(srcCanvas, 0, 0, outW, outH);
+    const dataUrl = outCanvas.toDataURL('image/jpeg', 0.92);
+
+    const metadata = halves.metadata;
+    metadata.isInsta360 = true;
+    metadata.is360Pano = false;
+    metadata.projectionType = 'fisheye';
+    if (metadata.compassHeading == null) {
+      metadata.headingSource = 'manual';
+    }
+
+    const photoId = addPhoto({
+      filename: file.name.replace(/\.insp$/i, '_sky.jpg'),
+      dataUrl,
+      width: outW,
+      height: outH,
+      projection: 'fisheye',
+      metadata,
+      fisheye: {
+        fov,
+        accelTilt: accelOri.valid ? accelOri.tilt : null,
+        accelClockAngle: accelOri.valid ? accelOri.clockAngle : null,
+        lensSide: selectedHalf.side,
+        calibration: lens,
+      },
+      coveragePoints: assignToSelected && _selectedPtId ? [_selectedPtId] : [],
+    });
+
+    if (assignToSelected && _selectedPtId) {
+      assignPhotoToPoints(photoId, [_selectedPtId]);
+    }
+
+    buildPhotoList();
+    drawArray();
+  } catch (err) {
+    console.error('Error processing INSP file:', err);
+  }
+}
+
+/**
+ * Show a modal dialog letting the user choose which fisheye half
+ * is the sky-facing one.
+ * @returns {Promise<{side:'left'|'right', canvas:HTMLCanvasElement}|null>}
+ */
+function showInspHalfSelector(halves, filename) {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    Object.assign(overlay.style, {
+      position: 'fixed', inset: '0', zIndex: '9999',
+      background: 'rgba(0,0,0,0.75)', display: 'flex',
+      alignItems: 'center', justifyContent: 'center',
+      padding: '20px',
+    });
+
+    const modal = document.createElement('div');
+    Object.assign(modal.style, {
+      background: 'var(--surface1)', borderRadius: 'var(--radius-lg)',
+      padding: '24px', maxWidth: '640px', width: '100%',
+      boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
+    });
+
+    modal.innerHTML = `
+      <h3 style="margin:0 0 6px 0;font-size:16px">Insta360 Dual-Fisheye Import</h3>
+      <p style="margin:0 0 16px 0;font-size:12px;color:var(--text2)">
+        Select the <strong>sky-facing</strong> half (the lens pointing away from the panel).
+        <br><span style="color:var(--text3);font-size:11px">${filename.replace(/[<>"'&]/g, '')}</span>
+      </p>
+      <div style="display:flex;gap:16px;justify-content:center">
+        <div id="insp-pick-left" style="cursor:pointer;text-align:center;border:2px solid transparent;border-radius:var(--radius-sm);padding:8px;transition:border-color 0.15s">
+          <img id="insp-img-left" style="width:200px;height:200px;object-fit:cover;border-radius:50%;display:block" />
+          <div style="font-size:11px;margin-top:6px;font-weight:500">Left half</div>
+          <div style="font-size:10px;color:var(--text3)">Lens 1</div>
+        </div>
+        <div id="insp-pick-right" style="cursor:pointer;text-align:center;border:2px solid transparent;border-radius:var(--radius-sm);padding:8px;transition:border-color 0.15s">
+          <img id="insp-img-right" style="width:200px;height:200px;object-fit:cover;border-radius:50%;display:block" />
+          <div style="font-size:11px;margin-top:6px;font-weight:500">Right half</div>
+          <div style="font-size:10px;color:var(--text3)">Lens 2</div>
+        </div>
+      </div>
+      <div style="text-align:center;margin-top:16px">
+        <button id="insp-cancel" class="btn" style="padding:6px 20px;font-size:12px">Cancel</button>
+      </div>
+    `;
+
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    modal.querySelector('#insp-img-left').src = halves.left.dataUrl;
+    modal.querySelector('#insp-img-right').src = halves.right.dataUrl;
+
+    function cleanup() { document.body.removeChild(overlay); }
+
+    modal.querySelector('#insp-pick-left').addEventListener('click', () => {
+      cleanup();
+      resolve({ side: 'left', canvas: halves.left.canvas });
+    });
+
+    modal.querySelector('#insp-pick-right').addEventListener('click', () => {
+      cleanup();
+      resolve({ side: 'right', canvas: halves.right.canvas });
+    });
+
+    modal.querySelector('#insp-cancel').addEventListener('click', () => {
+      cleanup();
+      resolve(null);
+    });
+
+    overlay.addEventListener('click', e => {
+      if (e.target === overlay) { cleanup(); resolve(null); }
+    });
+
+    for (const id of ['#insp-pick-left', '#insp-pick-right']) {
+      const pick = modal.querySelector(id);
+      pick.addEventListener('mouseenter', () => { pick.style.borderColor = 'var(--primary)'; });
+      pick.addEventListener('mouseleave', () => { pick.style.borderColor = 'transparent'; });
+    }
+  });
 }
 
 // ─── Photo Library ────────────────────────────────────

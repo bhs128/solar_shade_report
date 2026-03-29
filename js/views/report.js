@@ -6,11 +6,12 @@
 
 import { getState, setState, getSubPanels, getMergedHorizon } from '../state.js';
 import {
-  el, qs, qsa, clearEl, savColor, fmtPct, fmtNum, fmtDeg, fmtLatLon
+  el, qs, qsa, clearEl, savColor, fmtPct, fmtNum, fmtDeg, fmtLatLon,
+  maskLookupToHorizon
 } from '../utils.js';
 import {
   runFullAnalysis, runComparison, computeAllSunPaths,
-  sunPosition, solarDeclination,
+  sunPosition, solarDeclination, buildMergedShadeLookupForPoints,
   MONTHS, MDAYS, MDAYS_CUM
 } from '../solar-engine.js';
 
@@ -24,10 +25,11 @@ let _smCtx = null;
 let _smDpr = 1;
 let _hmBaseImage = null; // cached base heatmap for overlay efficiency
 let _hmPad = { l: 40, r: 14, t: 14, b: 6 };
-let _subHorizons = null; // Float32Array(360)[]
+let _subHorizons = null; // Float32Array(360)[] — derived from masks for heatmap
+let _subLookups = null;  // mask lookup functions for visibility computation
 let _allPaths = null;    // precomputed sun paths
 
-export function render(container) {
+export async function render(container) {
   _container = container;
   clearEl(container);
 
@@ -48,17 +50,17 @@ export function render(container) {
     return;
   }
 
-  // Run analysis
-  _results = runFullAnalysis();
+  // Run analysis (async for mask decoding)
+  _results = await runFullAnalysis();
 
   // Check for comparison scenario
   const scenarios = getAllScenarios();
   _comparison = null;
   if (state.compareScenario && state.compareScenario !== state.activeScenario) {
-    _comparison = runComparison(state.activeScenario, state.compareScenario);
+    _comparison = await runComparison(state.activeScenario, state.compareScenario);
   }
 
-  buildReport();
+  await buildReport();
 }
 
 function getAllScenarios() {
@@ -72,7 +74,7 @@ function getAllScenarios() {
   return [...names];
 }
 
-function buildReport() {
+async function buildReport() {
   const state = getState();
   const r = _results;
   if (!r) {
@@ -295,7 +297,7 @@ function buildReport() {
 
   buildPanelHeatmap();
   drawMonthlyChart();
-  initShadeMap();
+  await initShadeMap();
   buildMonthlyTable();
   buildHourlyTable(-1);
   buildPanelDetailTable();
@@ -323,10 +325,13 @@ function bindReportEvents() {
   qs('#sm-hour', _container)?.addEventListener('input', updateSimOverlay);
 
   // Shade map scenario dropdown
-  qs('#sm-scenario', _container)?.addEventListener('change', (e) => {
+  qs('#sm-scenario', _container)?.addEventListener('change', async (e) => {
     const scn = e.target.value;
     const subPanels = _results.subPanels;
-    _subHorizons = subPanels.map(sp => getMergedHorizon(sp.ptIds, scn));
+    _subLookups = await Promise.all(
+      subPanels.map(sp => buildMergedShadeLookupForPoints(sp.ptIds, scn))
+    );
+    _subHorizons = _subLookups.map(fn => maskLookupToHorizon(fn));
     drawHeatmapBase();
   });
 }
@@ -595,7 +600,7 @@ function buildPanelDetailTable() {
 
 // ─── Sky Visibility Heatmap ───────────────────────────
 
-function initShadeMap() {
+async function initShadeMap() {
   _smCanvas = qs('#c-shade-map', _container);
   if (!_smCanvas || !_results) return;
   _smCtx = _smCanvas.getContext('2d');
@@ -604,8 +609,11 @@ function initShadeMap() {
   const subPanels = _results.subPanels;
   const scn = state.activeScenario;
 
-  // Pre-compute merged horizons for all sub-panels
-  _subHorizons = subPanels.map(sp => getMergedHorizon(sp.ptIds, scn));
+  // Pre-build shade lookups and derive 1D horizons for heatmap rendering
+  _subLookups = await Promise.all(
+    subPanels.map(sp => buildMergedShadeLookupForPoints(sp.ptIds, scn))
+  );
+  _subHorizons = _subLookups.map(fn => maskLookupToHorizon(fn));
 
   // Pre-compute sun paths
   const lat = state.location.lat;
@@ -617,12 +625,13 @@ function initShadeMap() {
 /**
  * Compute sky visibility: for each (azimuth, elevation) pixel,
  * what fraction of sub-panels have a clear view?
+ * Uses 2D mask lookups when available, falls back to 1D horizons.
  */
 function computeVisibility() {
   const azMin = 60, azMax = 300, elMax = 80;
   const W = azMax - azMin, H = elMax;
   const vis = new Float32Array(W * H);
-  const n = _subHorizons.length;
+  const n = _subLookups ? _subLookups.length : (_subHorizons ? _subHorizons.length : 0);
   if (n === 0) return { vis, W, H, azMin, azMax, elMax };
 
   for (let by = 0; by < H; by++) {
@@ -630,8 +639,14 @@ function computeVisibility() {
     for (let bx = 0; bx < W; bx++) {
       const az = azMin + bx;
       let v = 0;
-      for (const h of _subHorizons) {
-        if (elv > h[az % 360]) v++;
+      if (_subLookups) {
+        for (const fn of _subLookups) {
+          if (!fn(az, elv)) v++;
+        }
+      } else {
+        for (const h of _subHorizons) {
+          if (elv > h[az % 360]) v++;
+        }
       }
       vis[by * W + bx] = v / n;
     }
