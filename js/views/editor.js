@@ -115,14 +115,19 @@ function buildEditorUI() {
           <div class="card" style="padding:12px">
             <h2 style="margin-bottom:8px">Photo</h2>
             <select id="sel-photo" style="width:100%;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 8px;font-size:12px">
-              ${Object.values(state.photos).map(p => `
-                <option value="${p.id}" ${p.id === _photoId ? 'selected' : ''}>${esc(p.filename)}</option>
-              `).join('')}
+              ${Object.values(state.photos).map(p => {
+                const _pts = (p.coveragePoints || [])
+                  .map(pid => state.points[pid]).filter(Boolean)
+                  .map(pt => `${String.fromCharCode(65 + pt.panelRow)}${pt.panelCol + 1} ${pt.name.replace('Point ', 'P')}`);
+                const _suf = _pts.length ? ` [${_pts.join(', ')}]` : ' [unassigned]';
+                return `<option value="${p.id}" ${p.id === _photoId ? 'selected' : ''}>${esc(p.filename + _suf)}</option>`;
+              }).join('')}
             </select>
             <div style="margin-top:4px;font-size:10px;color:var(--text3)">
               ${_isFisheye ? '&#128065; Fisheye projection' : '&#127758; Equirectangular projection'}
             </div>
           </div>
+          ${buildMiniPanelMap(state)}
 
           ${_isFisheye ? buildFisheyeOrientationUI(photo) : buildEquirectOrientationUI(photo)}
 
@@ -204,6 +209,7 @@ function buildEditorUI() {
   bindEditorEvents();
   loadMaskFromState();
   prefillFisheyeCorners();
+  drawMiniPanelMap();
   redraw();
 }
 
@@ -302,6 +308,113 @@ function buildEquirectOrientationUI(photo) {
       <span class="hint" style="color:var(--warning)">&#9888; No heading in metadata. Enter manually (180=South).</span>
     </div>
   `;
+}
+
+// ============================================================
+// Mini Panel Map
+// ============================================================
+
+function buildMiniPanelMap(state) {
+  const { rows, cols } = state.system;
+  if (rows === 0 || cols === 0 || Object.keys(state.points).length === 0) return '';
+  return `
+    <div class="card" style="padding:10px">
+      <h2 style="margin-bottom:4px;font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.4px">Array Map</h2>
+      <canvas id="mini-panel-map" style="width:100%;cursor:pointer;border-radius:4px"></canvas>
+      <div class="hint" style="margin-top:3px;font-size:9px">
+        <span style="color:#f5a623">&#9679;</span> current photo &nbsp;
+        <span style="color:#60a5fa">&#9679;</span> has photo &nbsp;
+        <span style="color:rgba(255,255,255,0.35)">&#9679;</span> unassigned
+      </div>
+    </div>
+  `;
+}
+
+function drawMiniPanelMap() {
+  const cvs = qs('#mini-panel-map', _container);
+  if (!cvs) return;
+
+  const state = getState();
+  const { rows, cols } = state.system;
+  if (rows === 0 || cols === 0) return;
+
+  const photo = state.photos[_photoId];
+  const currentPtIds = new Set(photo?.coveragePoints || []);
+
+  const dpr = window.devicePixelRatio || 1;
+  const displayW = cvs.clientWidth || 240;
+  const gap = 3;
+  const pad = 6;
+  const pw = Math.max(18, (displayW - 2 * pad - (cols - 1) * gap) / cols);
+  const ph = Math.max(14, pw * 0.55);
+  const totalH = 2 * pad + rows * ph + (rows - 1) * gap;
+
+  cvs.width = displayW * dpr;
+  cvs.height = totalH * dpr;
+  cvs.style.height = totalH + 'px';
+
+  const ctx = cvs.getContext('2d');
+  ctx.scale(dpr, dpr);
+
+  // Store layout for hit testing
+  cvs._miniLayout = { pad, gap, pw, ph, rows, cols };
+
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const x = pad + c * (pw + gap);
+      const y = pad + r * (ph + gap);
+
+      const pts = Object.values(state.points).filter(p => p.panelRow === r && p.panelCol === c);
+      const hasCurrent = pts.some(p => currentPtIds.has(p.id));
+      const hasAnyPhoto = pts.some(p => p.photoId);
+      const hasTrace = pts.some(p => {
+        const ph2 = state.photos[p.photoId];
+        return ph2 && Object.values(ph2.traces).some(t => t.paths.length > 0 || t.groundMask);
+      });
+
+      // Panel background
+      ctx.fillStyle = hasCurrent ? 'rgba(245,166,35,0.18)'
+        : hasTrace ? 'rgba(34,197,94,0.1)'
+        : hasAnyPhoto ? 'rgba(96,165,250,0.1)'
+        : 'rgba(255,255,255,0.04)';
+      ctx.fillRect(x, y, pw, ph);
+      ctx.strokeStyle = hasCurrent ? 'rgba(245,166,35,0.55)'
+        : hasTrace ? 'rgba(34,197,94,0.35)'
+        : hasAnyPhoto ? 'rgba(96,165,250,0.25)'
+        : 'rgba(255,255,255,0.1)';
+      ctx.lineWidth = hasCurrent ? 1.5 : 0.75;
+      ctx.strokeRect(x, y, pw, ph);
+
+      // Panel label
+      ctx.save();
+      ctx.font = '7px "JetBrains Mono", monospace';
+      ctx.fillStyle = 'rgba(255,255,255,0.3)';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText(`${String.fromCharCode(65 + r)}${c + 1}`, x + pw / 2, y + 1);
+      ctx.restore();
+
+      // Draw points
+      for (const pt of pts) {
+        const px = x + pt.localX * pw;
+        const py = y + pt.localY * ph;
+        const ptR = 3;
+
+        const isCurrent = currentPtIds.has(pt.id);
+        ctx.beginPath();
+        ctx.arc(px, py, ptR, 0, Math.PI * 2);
+        ctx.fillStyle = isCurrent ? 'rgba(245,166,35,0.8)'
+          : pt.photoId ? 'rgba(96,165,250,0.5)'
+          : 'rgba(255,255,255,0.2)';
+        ctx.fill();
+        ctx.strokeStyle = isCurrent ? '#f5a623'
+          : pt.photoId ? '#60a5fa'
+          : 'rgba(255,255,255,0.3)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+    }
+  }
 }
 
 // ============================================================
@@ -938,6 +1051,38 @@ function bindEditorEvents() {
     _photoId = e.target.value;
     _traceName = null;
     buildEditorUI();
+  });
+
+  // Mini panel map click — switch to the photo assigned to the clicked point
+  qs('#mini-panel-map', _container)?.addEventListener('click', (e) => {
+    const cvs = e.currentTarget;
+    const rect = cvs.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const L = cvs._miniLayout;
+    if (!L) return;
+    const state = getState();
+    for (let r = 0; r < L.rows; r++) {
+      for (let c = 0; c < L.cols; c++) {
+        const x = L.pad + c * (L.pw + L.gap);
+        const y = L.pad + r * (L.ph + L.gap);
+        if (mx >= x && mx <= x + L.pw && my >= y && my <= y + L.ph) {
+          const pts = Object.values(state.points).filter(p => p.panelRow === r && p.panelCol === c);
+          let best = null, bestD = Infinity;
+          for (const pt of pts) {
+            const d = Math.hypot(mx - (x + pt.localX * L.pw), my - (y + pt.localY * L.ph));
+            if (d < bestD) { bestD = d; best = pt; }
+          }
+          if (best && best.photoId && best.photoId !== _photoId) {
+            saveMaskToState();
+            _photoId = best.photoId;
+            _traceName = null;
+            buildEditorUI();
+          }
+          return;
+        }
+      }
+    }
   });
 
   // Manual heading

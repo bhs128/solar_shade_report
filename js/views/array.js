@@ -266,7 +266,7 @@ function drawPanel(row, col, state) {
   const hasPhoto = pts.some(p => p.photoId);
   const hasTrace = pts.some(p => {
     const ph = state.photos[p.photoId];
-    return ph && Object.values(ph.traces).some(t => t.paths.length > 0);
+    return ph && Object.values(ph.traces).some(t => t.paths.length > 0 || t.groundMask);
   });
 
   // Selected-point panel highlight
@@ -341,7 +341,7 @@ function drawPoint(pt, selected, hovered, state) {
 
   if (pt.photoId) {
     const photo = state.photos[pt.photoId];
-    const traced = photo && Object.values(photo.traces).some(t => t.paths.length > 0);
+    const traced = photo && Object.values(photo.traces).some(t => t.paths.length > 0 || t.groundMask);
     if (traced) {
       fill = 'rgba(34,197,94,0.6)'; stroke = '#22c55e';
     } else {
@@ -704,7 +704,7 @@ function updatePointPanel() {
 
 function photoDetailHTML(photo) {
   const meta = photo.metadata;
-  const traceCount = Object.values(photo.traces).reduce((n, t) => n + (t.paths.length > 0 ? 1 : 0), 0);
+  const traceCount = Object.values(photo.traces).reduce((n, t) => n + ((t.paths.length > 0 || t.groundMask) ? 1 : 0), 0);
   return `
     <div style="border-top:1px solid var(--border);padding-top:12px">
       <h3 style="font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px">
