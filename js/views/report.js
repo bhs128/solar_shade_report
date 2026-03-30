@@ -228,7 +228,7 @@ async function buildReport() {
           </select>
         </div>` : ''}
         <div id="shade-map-wrap" style="position:relative;width:100%;background:var(--surface2);border-radius:var(--radius-sm);overflow:hidden">
-          <canvas id="c-shade-map" width="680" height="240" style="display:block;width:100%"></canvas>
+          <canvas id="c-shade-map" width="1020" height="360" style="display:block;width:100%"></canvas>
         </div>
         <div style="display:flex;justify-content:space-between;margin-top:4px">
           <span class="legend-label">E (90°)</span><span class="legend-label">SE</span><span class="legend-label">S (180°)</span><span class="legend-label">SW</span><span class="legend-label">W (270°)</span>
@@ -629,15 +629,16 @@ async function initShadeMap() {
  */
 function computeVisibility() {
   const azMin = 60, azMax = 300, elMax = 80;
-  const W = azMax - azMin, H = elMax;
+  const SCALE = 3; // samples per degree for smoother rendering
+  const W = (azMax - azMin) * SCALE, H = elMax * SCALE;
   const vis = new Float32Array(W * H);
   const n = _subLookups ? _subLookups.length : (_subHorizons ? _subHorizons.length : 0);
   if (n === 0) return { vis, W, H, azMin, azMax, elMax };
 
   for (let by = 0; by < H; by++) {
-    const elv = by + 0.5;
+    const elv = (by + 0.5) / SCALE;
     for (let bx = 0; bx < W; bx++) {
-      const az = azMin + bx;
+      const az = azMin + (bx + 0.5) / SCALE;
       let v = 0;
       if (_subLookups) {
         for (const fn of _subLookups) {
@@ -645,7 +646,7 @@ function computeVisibility() {
         }
       } else {
         for (const h of _subHorizons) {
-          if (elv > h[az % 360]) v++;
+          if (elv > h[Math.round(az) % 360]) v++;
         }
       }
       vis[by * W + bx] = v / n;
