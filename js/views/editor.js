@@ -48,6 +48,10 @@ let _showSunPaths = true;
 let _showGrid = true;
 let _showMask = true;
 
+// Image cache to avoid reload flash when switching photos
+const _imgCache = new Map();
+let _isPhotoSwitch = false;
+
 // ============================================================
 // Public API
 // ============================================================
@@ -107,7 +111,7 @@ function buildEditorUI() {
   const canvasH = _isFisheye ? 800 : 600;
 
   _container.innerHTML = `
-    <div class="fade-in">
+    <div class="${_isPhotoSwitch ? '' : 'fade-in'}">
       <div class="editor-container">
         <!-- LEFT SIDEBAR -->
         <div class="editor-sidebar">
@@ -211,6 +215,7 @@ function buildEditorUI() {
   prefillFisheyeCorners();
   drawMiniPanelMap();
   redraw();
+  _isPhotoSwitch = false;
 }
 
 // ============================================================
@@ -446,10 +451,19 @@ function setupCanvas(photo) {
     );
   }
 
-  // Load the photo image
-  _img = new Image();
-  _img.onload = () => redraw();
-  _img.src = photo.dataUrl || '';
+  // Load the photo image (use cache to avoid flash on switch)
+  const cached = _imgCache.get(photo.id);
+  if (cached && cached.complete && cached.naturalWidth > 0) {
+    _img = cached;
+    // redraw() will be called by the caller
+  } else {
+    _img = new Image();
+    _img.onload = () => {
+      _imgCache.set(photo.id, _img);
+      redraw();
+    };
+    _img.src = photo.dataUrl || '';
+  }
 }
 
 // ============================================================
@@ -1050,6 +1064,7 @@ function bindEditorEvents() {
     saveMaskToState();
     _photoId = e.target.value;
     _traceName = null;
+    _isPhotoSwitch = true;
     buildEditorUI();
   });
 
@@ -1077,6 +1092,7 @@ function bindEditorEvents() {
             saveMaskToState();
             _photoId = best.photoId;
             _traceName = null;
+            _isPhotoSwitch = true;
             buildEditorUI();
           }
           return;
