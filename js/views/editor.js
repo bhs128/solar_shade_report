@@ -286,7 +286,7 @@ function buildFisheyeOrientationUI(photo) {
         <label style="font-size:10px;color:var(--text2)">FOV Half-Angle: <span id="lbl-ori-fov">${currentFov.toFixed(1)}°</span>
           <span style="color:var(--text3);font-size:9px">(raw: ${rawFov})</span>
         </label>
-        <input type="range" id="rng-fov" min="80" max="120" step="0.5" value="${currentFov}" style="width:100%">
+        <input type="range" id="rng-fov" min="80" max="130" step="0.5" value="${currentFov}" style="width:100%">
         <span class="hint" style="font-size:9px">Adjust until the 0° horizon ring matches the horizon in the image</span>
       </div>
       ${sunInfo}

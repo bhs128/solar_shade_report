@@ -1000,16 +1000,16 @@ export async function decodeMaskDataUrl(dataUrl) {
  * @returns {number} half-angle FOV in degrees (typically ~90 for 180° Insta360 lenses)
  */
 export function normalizeFisheyeFov(fov) {
-  if (fov == null || fov <= 0) return 100;
+  if (fov == null || fov <= 0) return 104;
   if (fov < 10) {
     // Likely in radians (e.g. π/2 ≈ 1.5708 for 90° half-angle)
     fov = fov * 180 / Math.PI;
-  } else if (fov > 120) {
-    // Likely full FOV in degrees (e.g. 200° → half = 100°)
+  } else if (fov > 140) {
+    // Likely full FOV in degrees (e.g. 208° → half = 104°)
     fov = fov / 2;
   }
   // Insta360 and similar fisheye lenses are >180° total (half-angle >90°)
-  return Math.max(95, Math.min(120, fov));
+  return Math.max(80, Math.min(130, fov));
 }
 
 /**
