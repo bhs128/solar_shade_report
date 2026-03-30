@@ -52,6 +52,7 @@ let _showMask = true;
 let _sunDisc = null;    // { cx, cy, r, foundX, foundY } in canvas coords, or null
 let _draggingSun = false;
 let _sunDragOffset = null;  // { dx, dy }
+let _hoveringSun = false;   // cursor is over the sun disc
 
 // Image cache to avoid reload flash when switching photos
 const _imgCache = new Map();
@@ -637,7 +638,12 @@ function getImagePixels() {
   } else {
     tctx.drawImage(_img, 0, 0, _img.naturalWidth, _img.naturalHeight / 2, 0, 0, W, H);
   }
-  return tctx.getImageData(0, 0, W, H);
+  try {
+    return tctx.getImageData(0, 0, W, H);
+  } catch (e) {
+    console.warn('[SolarScope] getImageData failed (CORS?):', e.message);
+    return null;
+  }
 }
 
 /**
@@ -680,6 +686,7 @@ function findBrightestRegion(imgData, W, H, searchRadius) {
  */
 function findSunCenter(imgData, W, discCx, discCy, discR) {
   const d = imgData.data;
+  const H = imgData.height;
   const r = Math.max(5, Math.floor(discR));
 
   // First: find the peak pixel in the disc
@@ -688,7 +695,7 @@ function findSunCenter(imgData, W, discCx, discCy, discR) {
     for (let dx = -r; dx <= r; dx++) {
       if (dx * dx + dy * dy > r * r) continue;
       const px = Math.round(discCx + dx), py = Math.round(discCy + dy);
-      if (px < 0 || px >= W || py < 0) continue;
+      if (px < 0 || px >= W || py < 0 || py >= H) continue;
       const idx = (py * W + px) * 4;
       const lum = d[idx] * 0.299 + d[idx + 1] * 0.587 + d[idx + 2] * 0.114;
       if (lum > bestLum) { bestLum = lum; bestX = px; bestY = py; }
@@ -702,7 +709,7 @@ function findSunCenter(imgData, W, discCx, discCy, discR) {
     for (let dx = -r; dx <= r; dx++) {
       if (dx * dx + dy * dy > r * r) continue;
       const px = Math.round(discCx + dx), py = Math.round(discCy + dy);
-      if (px < 0 || px >= W || py < 0) continue;
+      if (px < 0 || px >= W || py < 0 || py >= H) continue;
       const idx = (py * W + px) * 4;
       const lum = d[idx] * 0.299 + d[idx + 1] * 0.587 + d[idx + 2] * 0.114;
       if (lum >= threshold) {
@@ -720,13 +727,14 @@ function findSunCenter(imgData, W, discCx, discCy, discR) {
  */
 function initSunDisc() {
   const imgData = getImagePixels();
-  if (!imgData) return;
+  if (!imgData) { console.warn('[SolarScope] initSunDisc: no image pixels'); return; }
   const W = _canvas.width, H = _canvas.height;
   const defaultR = Math.round(W * 0.06);  // ~48px on 800px canvas
 
   if (!_sunDisc) {
     const bright = findBrightestRegion(imgData, W, H, defaultR);
     _sunDisc = { cx: bright.x, cy: bright.y, r: defaultR, foundX: 0, foundY: 0 };
+    console.log('[SolarScope] Sun disc initialized at', bright.x.toFixed(0), bright.y.toFixed(0));
   }
   const found = findSunCenter(imgData, W, _sunDisc.cx, _sunDisc.cy, _sunDisc.r);
   _sunDisc.foundX = found.x;
@@ -833,14 +841,15 @@ function redraw() {
   // Sun finder disc overlay
   if (_sunDisc && _isFisheye) {
     _ctx.save();
+    const hover = _hoveringSun || _draggingSun;
     // Semi-transparent yellow disc
     _ctx.beginPath();
     _ctx.arc(_sunDisc.cx, _sunDisc.cy, _sunDisc.r, 0, Math.PI * 2);
-    _ctx.fillStyle = 'rgba(255, 240, 120, 0.15)';
+    _ctx.fillStyle = hover ? 'rgba(255, 240, 120, 0.25)' : 'rgba(255, 240, 120, 0.12)';
     _ctx.fill();
-    _ctx.strokeStyle = 'rgba(255, 220, 60, 0.5)';
-    _ctx.lineWidth = 1.5;
-    _ctx.setLineDash([4, 4]);
+    _ctx.strokeStyle = hover ? 'rgba(255, 220, 60, 0.9)' : 'rgba(255, 220, 60, 0.4)';
+    _ctx.lineWidth = hover ? 2 : 1.5;
+    _ctx.setLineDash(hover ? [] : [4, 4]);
     _ctx.stroke();
     _ctx.setLineDash([]);
 
@@ -855,10 +864,10 @@ function redraw() {
     _ctx.stroke();
 
     // Small label
-    _ctx.fillStyle = 'rgba(255, 220, 60, 0.8)';
+    _ctx.fillStyle = hover ? 'rgba(255, 220, 60, 1)' : 'rgba(255, 220, 60, 0.7)';
     _ctx.font = '9px "JetBrains Mono", monospace';
     _ctx.textAlign = 'center';
-    _ctx.fillText('sun', _sunDisc.cx, _sunDisc.cy - _sunDisc.r - 4);
+    _ctx.fillText(hover ? 'drag to move \u00b7 scroll to resize' : 'sun', _sunDisc.cx, _sunDisc.cy - _sunDisc.r - 4);
     _ctx.restore();
   }
 
@@ -1439,18 +1448,22 @@ function bindCanvasEvents() {
     };
   };
 
+  /** Is the canvas point inside the sun disc? */
+  function isOverSunDisc(cx, cy) {
+    if (!_sunDisc || !_isFisheye) return false;
+    const dx = cx - _sunDisc.cx, dy = cy - _sunDisc.cy;
+    return dx * dx + dy * dy <= _sunDisc.r * _sunDisc.r;
+  }
+
   _canvas.addEventListener('mousedown', (e) => {
     e.preventDefault();
     const { cx, cy } = getPos(e);
 
     // Check if clicking on sun disc
-    if (_sunDisc && _isFisheye) {
-      const dx = cx - _sunDisc.cx, dy = cy - _sunDisc.cy;
-      if (dx * dx + dy * dy <= _sunDisc.r * _sunDisc.r) {
-        _draggingSun = true;
-        _sunDragOffset = { dx: _sunDisc.cx - cx, dy: _sunDisc.cy - cy };
-        return;
-      }
+    if (isOverSunDisc(cx, cy)) {
+      _draggingSun = true;
+      _sunDragOffset = { dx: _sunDisc.cx - cx, dy: _sunDisc.cy - cy };
+      return;
     }
 
     _isPainting = true;
@@ -1470,6 +1483,13 @@ function bindCanvasEvents() {
       return;
     }
 
+    // Track hover state for visual feedback
+    const overSun = isOverSunDisc(cx, cy);
+    if (overSun !== _hoveringSun) {
+      _hoveringSun = overSun;
+      _canvas.style.cursor = overSun ? 'grab' : 'crosshair';
+    }
+
     if (_isPainting && _lastPaintPos) {
       paintLine(_lastPaintPos.x, _lastPaintPos.y, cx, cy);
       _lastPaintPos = { x: cx, y: cy };
@@ -1481,7 +1501,7 @@ function bindCanvasEvents() {
       if (sky && sky.valid !== false) {
         _canvas.title = `Az: ${(sky.azimuth ?? 0).toFixed(1)}° El: ${(sky.elevation ?? 0).toFixed(1)}°`;
       }
-      // Redraw to update cursor circle
+      // Redraw to update cursor circle / hover state
       redraw();
     }
   });
@@ -1490,6 +1510,7 @@ function bindCanvasEvents() {
     if (_draggingSun) {
       _draggingSun = false;
       _sunDragOffset = null;
+      _canvas.style.cursor = _hoveringSun ? 'grab' : 'crosshair';
       return;
     }
     if (_isPainting) {
@@ -1507,6 +1528,8 @@ function bindCanvasEvents() {
       _isPainting = false;
       debouncedSave();
     }
+    _hoveringSun = false;
+    _canvas.style.cursor = 'crosshair';
     _lastPaintPos = null;
     redraw();
   });
@@ -1516,14 +1539,11 @@ function bindCanvasEvents() {
     e.preventDefault();
     const { cx, cy } = getPos(e);
 
-    if (_sunDisc && _isFisheye) {
-      const dx = cx - _sunDisc.cx, dy = cy - _sunDisc.cy;
-      if (dx * dx + dy * dy <= (_sunDisc.r + 10) * (_sunDisc.r + 10)) {
-        _sunDisc.r = Math.max(10, Math.min(200, _sunDisc.r + (e.deltaY > 0 ? -4 : 4)));
-        updateSunFound();
-        redraw();
-        return;
-      }
+    if (isOverSunDisc(cx, cy)) {
+      _sunDisc.r = Math.max(10, Math.min(200, _sunDisc.r + (e.deltaY > 0 ? -4 : 4)));
+      updateSunFound();
+      redraw();
+      return;
     }
 
     _brushSize = Math.max(5, Math.min(150, _brushSize + (e.deltaY > 0 ? -3 : 3)));
