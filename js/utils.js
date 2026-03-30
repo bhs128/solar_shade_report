@@ -788,7 +788,8 @@ export function skyToFisheye(az, el, worldToCamera, imgSize, fov = 90) {
   const r = (theta / halfFov) * R;
 
   // Angle in sensor plane
-  const phi = Math.atan2(cx, -cy); // +X=right, -Y=up in image convention
+  // Convention: camera +Y = uphill direction → maps to image top (smaller py)
+  const phi = Math.atan2(cx, cy);
 
   const px = imgSize / 2 + r * Math.sin(phi);
   const py = imgSize / 2 - r * Math.cos(phi);
@@ -820,10 +821,11 @@ export function fisheyeToSky(px, py, worldToCamera, imgSize, fov = 90) {
   const theta = (r / R) * halfFov; // angle from optical axis
 
   // Direction in camera frame
-  const phi = Math.atan2(dx, dy); // angle in sensor plane from up
+  // Convention matches skyToFisheye: camera +Y = image up
+  const phi = Math.atan2(dx, dy);
   const sinTheta = Math.sin(theta);
   const cam_x = sinTheta * Math.sin(phi);
-  const cam_y = -sinTheta * Math.cos(phi);
+  const cam_y = sinTheta * Math.cos(phi);
   const cam_z = Math.cos(theta);
 
   // We need camera→world inverse. Since rotation matrix is orthogonal, inverse = transpose.
@@ -998,7 +1000,7 @@ export async function decodeMaskDataUrl(dataUrl) {
  * @returns {number} half-angle FOV in degrees (typically ~90 for 180° Insta360 lenses)
  */
 export function normalizeFisheyeFov(fov) {
-  if (fov == null || fov <= 0) return 90;
+  if (fov == null || fov <= 0) return 100;
   if (fov < 10) {
     // Likely in radians (e.g. π/2 ≈ 1.5708 for 90° half-angle)
     fov = fov * 180 / Math.PI;
@@ -1006,8 +1008,8 @@ export function normalizeFisheyeFov(fov) {
     // Likely full FOV in degrees (e.g. 200° → half = 100°)
     fov = fov / 2;
   }
-  // Clamp to reasonable range for fisheye lenses
-  return Math.max(70, Math.min(110, fov));
+  // Insta360 and similar fisheye lenses are >180° total (half-angle >90°)
+  return Math.max(95, Math.min(120, fov));
 }
 
 /**

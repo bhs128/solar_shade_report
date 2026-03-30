@@ -722,6 +722,20 @@ function drawHeatmapBase() {
       { m: 2,  label: 'Equinox',       color: '#e0e0e0', dash: [4, 3] },
       { m: 11, label: 'Dec solstice',   color: '#f09050', dash: [] }
     ];
+
+    // Add photo capture date path if available
+    let photoDoy = null;
+    for (const photo of Object.values(state.photos)) {
+      if (photo.metadata?.datetime) {
+        const dt = photo.metadata.datetime instanceof Date
+          ? photo.metadata.datetime : new Date(photo.metadata.datetime);
+        if (!isNaN(dt.getTime())) {
+          photoDoy = Math.floor((dt - new Date(dt.getFullYear(), 0, 0)) / 86400000);
+          break;
+        }
+      }
+    }
+
     const toX = az => pad.l + ((az - azMin) / (azMax - azMin)) * dw;
     const toY = el => pad.t + dh * (1 - el / elMax);
 
@@ -762,6 +776,25 @@ function drawHeatmapBase() {
           ctx.fillText(h12 + ap, toX(sp.azimuth), toY(sp.elevation) + (k.m === 5 ? -7 : 10));
         }
       }
+    }
+
+    // Photo date sun path
+    if (photoDoy != null) {
+      const decl = solarDeclination(photoDoy);
+      const pts = [];
+      for (let ha = -90; ha <= 90; ha += 0.5) {
+        const sp = sunPosition(lat, decl, ha);
+        if (sp.elevation > 0 && sp.azimuth >= azMin && sp.azimuth <= azMax) pts.push(sp);
+      }
+      if (pts.length > 1) {
+        ctx.beginPath();
+        ctx.moveTo(toX(pts[0].azimuth), toY(pts[0].elevation));
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(toX(pts[i].azimuth), toY(pts[i].elevation));
+        ctx.strokeStyle = '#4ade80';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+      kp.push({ label: 'Photo date', color: '#4ade80', dash: [] });
     }
 
     // Legend (sun path key)

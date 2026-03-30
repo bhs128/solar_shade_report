@@ -13,7 +13,7 @@ import {
   sunPositionAtTime, maskLookupToHorizon, buildSkyMaskLookup,
   decodeMaskDataUrl, debounce, normalizeFisheyeFov
 } from '../utils.js';
-import { computeAllSunPaths, sunPosition, solarDeclination, MONTHS } from '../solar-engine.js';
+import { computeAllSunPaths, sunPosition, solarDeclination, MONTHS, MDAYS_CUM } from '../solar-engine.js';
 
 // ============================================================
 // Module state
@@ -226,8 +226,8 @@ function buildFisheyeOrientationUI(photo) {
 
   // Sun position from EXIF
   let sunInfo = '';
-  if (photo.metadata?.dateTime && state.location.lat != null) {
-    const sp = sunPositionAtTime(photo.metadata.dateTime, state.location.lat, state.location.lon);
+  if (photo.metadata?.datetime && state.location.lat != null) {
+    const sp = sunPositionAtTime(photo.metadata.datetime, state.location.lat, state.location.lon);
     if (sp && sp.elevation > 0) {
       sunInfo = `<div style="margin-top:4px;font-size:10px;color:var(--sun)">&#9788; Sun at capture: Az ${sp.azimuth.toFixed(1)}° El ${sp.elevation.toFixed(1)}°</div>`;
     }
@@ -657,18 +657,42 @@ function drawSunPaths(W, H) {
   // Get mask data for shading detection
   const maskId = _maskCtx.getImageData(0, 0, _maskCanvas.width, _maskCanvas.height);
 
-  const allPaths = computeAllSunPaths(lat);
-  const monthAlpha = ['44', '55', '77', '88', 'aa', 'cc', 'cc', 'aa', '88', '77', '55', '44'];
+  // Build 4 sun paths: June solstice, Equinox, December solstice, + photo capture date
+  const pathDefs = [
+    { doy: MDAYS_CUM[5] + 21,  label: 'Jun solstice', color: '#f5c842', alpha: 'cc', lw: 1.5, dash: [] },
+    { doy: MDAYS_CUM[2] + 21,  label: 'Equinox',      color: '#e0e0e0', alpha: 'aa', lw: 1.2, dash: [4, 3] },
+    { doy: MDAYS_CUM[11] + 21, label: 'Dec solstice',  color: '#f09050', alpha: 'cc', lw: 1.5, dash: [] },
+  ];
+
+  // Add photo capture date path
+  const photo = getState().photos[_photoId];
+  let photoDoy = null;
+  if (photo?.metadata?.datetime) {
+    const dt = photo.metadata.datetime instanceof Date
+      ? photo.metadata.datetime : new Date(photo.metadata.datetime);
+    if (!isNaN(dt.getTime())) {
+      photoDoy = Math.floor((dt - new Date(dt.getFullYear(), 0, 0)) / 86400000);
+      pathDefs.push({ doy: photoDoy, label: 'Photo date', color: '#4ade80', alpha: 'dd', lw: 2, dash: [] });
+    }
+  }
 
   _ctx.save();
-  for (let m = 0; m < 12; m++) {
-    const path = allPaths[m];
-    for (let i = 1; i < path.length; i++) {
-      const p0 = path[i - 1], p1 = path[i];
+  for (const pd of pathDefs) {
+    const decl = solarDeclination(pd.doy);
+    const pts = [];
+    for (let ha = -90; ha <= 90; ha += 0.5) {
+      const p = sunPosition(lat, decl, ha);
+      if (p.elevation > 0) pts.push({ ...p, ha });
+    }
+
+    _ctx.setLineDash(pd.dash);
+    for (let i = 1; i < pts.length; i++) {
+      const p0 = pts[i - 1], p1 = pts[i];
       const c0 = skyToCanvas(p0.azimuth, p0.elevation);
       const c1 = skyToCanvas(p1.azimuth, p1.elevation);
 
-      if (!c0.visible && !c1.visible) continue;
+      // Skip if either endpoint is outside visible area
+      if (!c0.visible || !c1.visible) continue;
       if (c0.x < -50 || c0.x > W + 50 || c1.x < -50 || c1.x > W + 50) continue;
       if (c0.y < -50 || c0.y > H + 50 || c1.y < -50 || c1.y > H + 50) continue;
 
@@ -680,32 +704,68 @@ function drawSunPaths(W, H) {
       _ctx.beginPath();
       _ctx.moveTo(c0.x, c0.y);
       _ctx.lineTo(c1.x, c1.y);
-      _ctx.strokeStyle = sh ? `#ef4444${monthAlpha[m]}` : `#f5a623${monthAlpha[m]}`;
-      _ctx.lineWidth = sh ? 2 : 1.2;
+      _ctx.strokeStyle = sh ? `#ef4444${pd.alpha}` : `${pd.color}${pd.alpha}`;
+      _ctx.lineWidth = sh ? pd.lw + 0.5 : pd.lw;
       _ctx.stroke();
+    }
+    _ctx.setLineDash([]);
+
+    // Hour labels along path
+    for (let ha = -75; ha <= 75; ha += 15) {
+      const p = sunPosition(lat, solarDeclination(pd.doy), ha);
+      if (p.elevation <= 1) continue;
+      const c = skyToCanvas(p.azimuth, p.elevation);
+      if (!c.visible) continue;
+      if (ha % 30 === 0) {
+        const hr = 12 + ha / 15;
+        const h12 = hr > 12 ? hr - 12 : hr;
+        const ap = hr >= 12 ? 'p' : 'a';
+        _ctx.fillStyle = pd.color;
+        _ctx.font = '500 9px "JetBrains Mono", monospace';
+        _ctx.textAlign = 'center';
+        _ctx.fillText(h12 + ap, c.x, c.y - 6);
+      }
+      // Small dot at each hour
+      _ctx.beginPath();
+      _ctx.arc(c.x, c.y, 2.5, 0, Math.PI * 2);
+      _ctx.fillStyle = pd.color;
+      _ctx.fill();
     }
   }
 
-  // Draw current sun position icon if fisheye with EXIF time
-  if (_isFisheye) {
-    const photo = getState().photos[_photoId];
-    if (photo?.metadata?.dateTime && lat != null) {
-      const sp = sunPositionAtTime(photo.metadata.dateTime, lat, state.location.lon);
-      if (sp && sp.elevation > 0) {
-        const sc = skyToCanvas(sp.azimuth, sp.elevation);
-        if (sc.visible) {
+  // Draw current sun position icon (from EXIF capture time)
+  if (photo?.metadata?.datetime && lat != null) {
+    const sp = sunPositionAtTime(photo.metadata.datetime, lat, state.location.lon);
+    if (sp && sp.elevation > 0) {
+      const sc = skyToCanvas(sp.azimuth, sp.elevation);
+      if (sc.visible) {
+        // Glow
+        const g = _ctx.createRadialGradient(sc.x, sc.y, 0, sc.x, sc.y, 16);
+        g.addColorStop(0, 'rgba(245,200,66,0.5)');
+        g.addColorStop(1, 'rgba(245,200,66,0)');
+        _ctx.fillStyle = g;
+        _ctx.beginPath();
+        _ctx.arc(sc.x, sc.y, 16, 0, Math.PI * 2);
+        _ctx.fill();
+
+        // Sun disc
+        _ctx.beginPath();
+        _ctx.arc(sc.x, sc.y, 8, 0, Math.PI * 2);
+        _ctx.fillStyle = '#f5c842';
+        _ctx.fill();
+        _ctx.strokeStyle = '#fff';
+        _ctx.lineWidth = 1.5;
+        _ctx.stroke();
+
+        // Rays
+        for (let a = 0; a < 8; a++) {
+          const an = a * Math.PI / 4;
           _ctx.beginPath();
-          _ctx.arc(sc.x, sc.y, 8, 0, Math.PI * 2);
-          _ctx.fillStyle = '#f5c842';
-          _ctx.fill();
-          _ctx.strokeStyle = '#000';
+          _ctx.moveTo(sc.x + Math.cos(an) * 11, sc.y + Math.sin(an) * 11);
+          _ctx.lineTo(sc.x + Math.cos(an) * 15, sc.y + Math.sin(an) * 15);
+          _ctx.strokeStyle = '#f5c842';
           _ctx.lineWidth = 1.5;
           _ctx.stroke();
-          _ctx.fillStyle = '#000';
-          _ctx.font = 'bold 10px sans-serif';
-          _ctx.textAlign = 'center';
-          _ctx.textBaseline = 'middle';
-          _ctx.fillText('☀', sc.x, sc.y);
         }
       }
     }
