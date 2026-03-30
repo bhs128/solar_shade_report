@@ -538,20 +538,27 @@ function drawGrid(W, H) {
   _ctx.font = '10px "JetBrains Mono", monospace';
 
   if (_isFisheye) {
-    // Elevation rings
-    for (let el = 10; el <= 80; el += 10) {
+    // Elevation rings (include 0° horizon)
+    for (let el = 0; el <= 80; el += 10) {
+      const isHorizon = el === 0;
       _ctx.beginPath();
-      _ctx.strokeStyle = 'rgba(255,255,255,0.35)';
-      _ctx.lineWidth = 1;
-      const pts = [];
+      _ctx.strokeStyle = isHorizon ? 'rgba(255,200,0,0.4)' : 'rgba(255,255,255,0.35)';
+      _ctx.lineWidth = isHorizon ? 2 : 1;
+      let started = false;
       for (let az = 0; az < 360; az += 2) {
         const p = skyToCanvas(az, el);
-        if (p.visible) pts.push(p);
+        if (p.visible) {
+          if (started) _ctx.lineTo(p.x, p.y);
+          else { _ctx.moveTo(p.x, p.y); started = true; }
+        } else {
+          started = false; // break the path at invisible gaps
+        }
       }
-      if (pts.length > 2) {
-        _ctx.moveTo(pts[0].x, pts[0].y);
-        for (let i = 1; i < pts.length; i++) _ctx.lineTo(pts[i].x, pts[i].y);
-        _ctx.closePath();
+      // Close ring only if the full circle is visible (no gaps)
+      const pLast = skyToCanvas(358, el);
+      const pFirst = skyToCanvas(0, el);
+      if (pLast.visible && pFirst.visible) {
+        _ctx.lineTo(pFirst.x, pFirst.y);
       }
       _ctx.stroke();
 
