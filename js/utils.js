@@ -957,16 +957,16 @@ export function accelToOrientation(accel) {
   const mag = Math.sqrt(ax * ax + ay * ay + azVal * azVal);
   if (mag < 0.5) return { tilt: null, clockAngle: null, valid: false };
 
-  // Camera optical axis is camera +Z.
-  // If panel is flat → gravity fully in -Z → tilt=0.
-  // Angle between gravity and -Z = panel tilt from horizontal.
-  const cosAngle = -azVal / mag;
+  // Insta360 X3 optical axis is camera +Y (lenses face perpendicular to the stick).
+  // Camera Z = along the stick/bar, X = sideways.
+  // When lens points at zenith: ay = +1g, tilt = 0°.
+  // Tilt = angle between optical axis (+Y) and gravity direction.
+  const cosAngle = ay / mag;
   const tilt = Math.acos(Math.max(-1, Math.min(1, cosAngle))) * 180 / Math.PI;
 
-  // Clock angle: direction of "downhill" in sensor plane = direction of gravity projected into XY.
-  // gravity projected into camera XY = (ax, ay) (we use convention: Y=up in image)
-  // clockAngle = angle from "up in image" to gravity projection
-  const clockAngle = ((Math.atan2(-ax, ay) * 180 / Math.PI) + 360) % 360;
+  // Clock angle: direction of "downhill" in the image = gravity projected into the XZ sensor plane.
+  // Convention: measured from image top (camera -Z maps to image top for the left half).
+  const clockAngle = ((Math.atan2(ax, -azVal) * 180 / Math.PI) + 360) % 360;
 
   return { tilt, clockAngle, valid: true };
 }
