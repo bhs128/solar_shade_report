@@ -96,25 +96,12 @@ function buildUI() {
         </div>
       </div>
 
-      <!-- Point Detail & Photo Library -->
+      <!-- Point Detail -->
       <div class="card" id="point-panel">
         <div class="card-header">
           <h2 id="point-panel-title">Point Detail</h2>
-          <span class="hint" id="photo-count">${Object.keys(state.photos).length} photo(s)</span>
         </div>
-        <div style="display:grid;grid-template-columns:160px 1fr;gap:16px;min-height:180px">
-          <!-- LEFT: Photo Filmstrip -->
-          <div style="border-right:1px solid var(--border);padding-right:12px;display:flex;flex-direction:column;gap:8px">
-            <div class="upload-zone" id="upload-zone" style="padding:10px;cursor:pointer;flex-shrink:0">
-              <div style="font-size:16px;opacity:0.4">&#128247;</div>
-              <div class="upload-text" style="font-size:10px">Upload photos</div>
-            </div>
-            <input type="file" id="file-photo-input" accept="image/*,.insp" multiple style="display:none">
-            <div id="photo-list" style="display:flex;flex-direction:column;gap:6px;overflow-y:auto;flex:1;max-height:360px"></div>
-          </div>
-          <!-- RIGHT: Point Detail -->
-          <div id="point-detail-area"></div>
-        </div>
+        <div id="point-detail-area" style="min-height:180px"></div>
       </div>
 
       <div style="text-align:center;margin-top:8px">
@@ -127,37 +114,12 @@ function buildUI() {
 
   initCanvas();
   updatePointPanel();
-  buildPhotoList();
   bindEvents();
 }
 
 function bindEvents() {
   qs('#btn-add-pt', _container).addEventListener('click', doAddPoint);
   qs('#btn-del-pt', _container).addEventListener('click', doDeletePoint);
-
-  // Library upload
-  const uploadZone = qs('#upload-zone', _container);
-  const fileInput = qs('#file-photo-input', _container);
-  uploadZone.addEventListener('click', () => fileInput.click());
-  uploadZone.addEventListener('dragover', e => {
-    e.preventDefault();
-    uploadZone.style.borderColor = 'var(--sun)';
-    uploadZone.style.background = 'var(--sun-dim)';
-  });
-  uploadZone.addEventListener('dragleave', () => {
-    uploadZone.style.borderColor = '';
-    uploadZone.style.background = '';
-  });
-  uploadZone.addEventListener('drop', e => {
-    e.preventDefault();
-    uploadZone.style.borderColor = '';
-    uploadZone.style.background = '';
-    handleFiles(e.dataTransfer.files);
-  });
-  fileInput.addEventListener('change', e => {
-    handleFiles(e.target.files);
-    e.target.value = '';
-  });
 
   qs('#btn-next-editor', _container).addEventListener('click', () => {
     document.querySelector('[data-view="editor"]').click();
@@ -674,13 +636,9 @@ function updatePointPanel() {
       setState('_selectedPhotoId', photo.id);
       document.querySelector('[data-view="editor"]').click();
     });
-    qs('#btn-pt-unassign', area)?.addEventListener('click', () => {
-      const p = state.points[_selectedPtId];
-      if (p) {
-        p.photoId = null;
-        const ph = state.photos[photo.id];
-        if (ph) ph.coveragePoints = ph.coveragePoints.filter(id => id !== _selectedPtId);
-      }
+    qs('#btn-pt-delete-photo', area)?.addEventListener('click', () => {
+      if (!confirm('Delete this photo? Trace data will be lost.')) return;
+      removePhoto(photo.id);
       updatePointPanel();
       drawArray();
     });
@@ -735,7 +693,7 @@ function photoDetailHTML(photo) {
       </div>
       <div style="display:flex;gap:6px;margin-top:10px">
         <button class="btn btn-sm" id="btn-pt-editor">Open in Editor \u2192</button>
-        <button class="btn btn-sm" id="btn-pt-unassign">Unassign</button>
+        <button class="btn btn-sm" id="btn-pt-delete-photo" style="color:var(--loss)">Delete Photo</button>
       </div>
     </div>
   `;
@@ -751,10 +709,7 @@ function photoUploadHTML() {
         <div style="font-size:18px;opacity:0.4">&#128247;</div>
         <div class="upload-text" style="font-size:11px">Drop photo or click to upload</div>
       </div>
-      <input type="file" id="pt-file-input" accept="image/*" style="display:none">
-      <p class="hint" style="margin-top:6px;font-size:10px">
-        Or click a photo in the library below to assign it.
-      </p>
+      <input type="file" id="pt-file-input" accept="image/*,.insp" style="display:none">
     </div>
   `;
 }
@@ -769,19 +724,6 @@ function updatePointCoords() {
 
 // ─── File Handling ────────────────────────────────────
 
-async function handleFiles(files) {
-  for (const file of files) {
-    if (isInspFile(file)) {
-      await processInspFile(file, false);
-      continue;
-    }
-    if (!file.type.startsWith('image/')) continue;
-    await processFile(file, false);
-  }
-  buildPhotoList();
-  drawArray();
-}
-
 async function handleFilesForPoint(files) {
   for (const file of files) {
     if (isInspFile(file)) {
@@ -792,7 +734,6 @@ async function handleFilesForPoint(files) {
     await processFile(file, true);
   }
   updatePointPanel();
-  buildPhotoList();
   drawArray();
 }
 
@@ -884,7 +825,6 @@ async function processInspFile(file, assignToSelected) {
       assignPhotoToPoints(photoId, [_selectedPtId]);
     }
 
-    buildPhotoList();
     drawArray();
   } catch (err) {
     console.error('Error processing INSP file:', err);
@@ -969,60 +909,6 @@ function showInspHalfSelector(halves, filename) {
       pick.addEventListener('mouseleave', () => { pick.style.borderColor = 'transparent'; });
     }
   });
-}
-
-// ─── Photo Library ────────────────────────────────────
-
-function buildPhotoList() {
-  const listEl = qs('#photo-list', _container);
-  if (!listEl) return;
-  clearEl(listEl);
-
-  const state = getState();
-  const photos = Object.values(state.photos);
-  const countEl = qs('#photo-count', _container);
-  if (countEl) countEl.textContent = `${photos.length} photo(s)`;
-
-  if (photos.length === 0) return;
-
-  for (const photo of photos) {
-    const thumb = el('div');
-    thumb.style.cssText = 'display:flex;gap:8px;padding:6px;border-radius:var(--radius-sm);background:var(--surface2);cursor:pointer;transition:border-color 0.15s;border:1px solid transparent;align-items:center';
-
-    const img = el('img');
-    img.src = photo.dataUrl;
-    img.alt = photo.filename;
-    img.style.cssText = 'width:48px;height:36px;object-fit:cover;border-radius:3px;flex-shrink:0';
-    thumb.appendChild(img);
-
-    const info = el('div');
-    info.style.cssText = 'min-width:0;overflow:hidden';
-    const fe = photo.fisheye || {};
-    const oriTag = fe.accelTilt != null ? ` · ${fe.accelTilt.toFixed(0)}°` : '';
-    info.innerHTML = `
-      <div style="font-size:10px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(photo.filename)}</div>
-      <div style="font-size:9px;color:var(--text3);margin-top:1px">${photo.coveragePoints.length} pt(s)${oriTag}</div>
-    `;
-    thumb.appendChild(info);
-
-    thumb.addEventListener('mouseenter', () => { thumb.style.borderColor = 'var(--sun)'; });
-    thumb.addEventListener('mouseleave', () => { thumb.style.borderColor = 'transparent'; });
-
-    thumb.addEventListener('click', () => {
-      if (_selectedPtId) {
-        assignPhotoToPoints(photo.id, [_selectedPtId]);
-        updatePointPanel();
-        drawArray();
-        buildPhotoList();
-      }
-    });
-
-    thumb.title = _selectedPtId
-      ? 'Click to assign to selected point'
-      : 'Select a point first to assign';
-
-    listEl.appendChild(thumb);
-  }
 }
 
 // ─── Helpers ──────────────────────────────────────────
