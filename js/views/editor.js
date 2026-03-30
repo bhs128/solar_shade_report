@@ -219,6 +219,8 @@ function buildFisheyeOrientationUI(photo) {
   const panelAz = ori.panelAzimuth ?? sys.azimuth;
   const panelTilt = ori.panelTilt ?? sys.tilt;
   const clockAngle = ori.clockAngle ?? fe.accelClockAngle ?? 0;
+  const currentFov = ori.fov ?? normalizeFisheyeFov(fe.fov);
+  const rawFov = fe.fov != null ? fe.fov.toFixed(1) : '—';
 
   // Build reference rows info
   const accelTilt = fe.accelTilt != null ? fe.accelTilt.toFixed(1) + '°' : '—';
@@ -269,6 +271,13 @@ function buildFisheyeOrientationUI(photo) {
         <label style="font-size:10px;color:var(--text2)">Clock Angle</label>
         <input type="range" id="rng-clock-angle" min="-180" max="180" step="0.5" value="${clockAngle}" style="width:100%">
       </div>
+      <div>
+        <label style="font-size:10px;color:var(--text2)">FOV Half-Angle: <span id="lbl-ori-fov">${currentFov.toFixed(1)}°</span>
+          <span style="color:var(--text3);font-size:9px">(raw: ${rawFov})</span>
+        </label>
+        <input type="range" id="rng-fov" min="80" max="120" step="0.5" value="${currentFov}" style="width:100%">
+        <span class="hint" style="font-size:9px">Adjust until the 0° horizon ring matches the horizon in the image</span>
+      </div>
       ${sunInfo}
     </div>
   `;
@@ -316,7 +325,7 @@ function setupCanvas(photo) {
   if (_isFisheye && photo.fisheye) {
     const ori = photo.orientation || {};
     const sys = getState().system;
-    _fov = normalizeFisheyeFov(photo.fisheye.fov);
+    _fov = ori.fov ?? normalizeFisheyeFov(photo.fisheye.fov);
     _worldToCamera = buildFisheyeRotation(
       ori.panelAzimuth ?? sys.azimuth,
       ori.panelTilt ?? sys.tilt,
@@ -435,7 +444,8 @@ function getOrientation() {
 function rebuildFisheyeTransform() {
   const o = getOrientation();
   const photo = getState().photos[_photoId];
-  _fov = normalizeFisheyeFov(photo?.fisheye?.fov);
+  const ori = photo?.orientation || {};
+  _fov = ori.fov ?? normalizeFisheyeFov(photo?.fisheye?.fov);
   _worldToCamera = buildFisheyeRotation(o.panelAz, o.panelTilt, o.clockAngle);
 }
 
@@ -934,7 +944,7 @@ function bindEditorEvents() {
   qs('#inp-manual-heading', _container)?.addEventListener('change', () => redraw());
 
   // Fisheye orientation sliders
-  for (const id of ['rng-panel-az', 'rng-panel-tilt', 'rng-clock-angle']) {
+  for (const id of ['rng-panel-az', 'rng-panel-tilt', 'rng-clock-angle', 'rng-fov']) {
     qs(`#${id}`, _container)?.addEventListener('input', (e) => {
       const photo = getState().photos[_photoId];
       if (!photo) return;
@@ -948,6 +958,10 @@ function bindEditorEvents() {
         photo.orientation.panelTilt = v;
         const lbl = qs('#lbl-ori-tilt', _container);
         if (lbl) lbl.textContent = v + '°';
+      } else if (id === 'rng-fov') {
+        photo.orientation.fov = v;
+        const lbl = qs('#lbl-ori-fov', _container);
+        if (lbl) lbl.textContent = v.toFixed(1) + '°';
       } else {
         photo.orientation.clockAngle = v;
         const lbl = qs('#lbl-ori-clk', _container);

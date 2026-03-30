@@ -1031,7 +1031,7 @@ export function buildSkyMaskLookup(photo, maskData, systemDefaults = {}) {
     const panelTilt = ori.panelTilt ?? systemDefaults.tilt ?? 30;
     const clockAngle = ori.clockAngle ?? photo.fisheye.accelClockAngle ?? 0;
     const worldToCamera = buildFisheyeRotation(panelAz, panelTilt, clockAngle);
-    const fov = normalizeFisheyeFov(photo.fisheye.fov);
+    const fov = ori.fov ?? normalizeFisheyeFov(photo.fisheye.fov);
     const imgSize = Math.min(width, height);
     const D = Math.PI / 180;
 
