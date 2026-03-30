@@ -48,6 +48,11 @@ let _showSunPaths = true;
 let _showGrid = true;
 let _showMask = true;
 
+// Sun finder disc state
+let _sunDisc = null;    // { cx, cy, r, foundX, foundY } in canvas coords, or null
+let _draggingSun = false;
+let _sunDragOffset = null;  // { dx, dy }
+
 // Image cache to avoid reload flash when switching photos
 const _imgCache = new Map();
 let _isPhotoSwitch = false;
@@ -292,6 +297,10 @@ function buildFisheyeOrientationUI(photo) {
         <input type="range" id="rng-fov" min="80" max="130" step="0.5" value="${currentFov}" style="width:100%">
         <span class="hint" style="font-size:9px">Adjust until the 0° horizon ring matches the horizon in the image</span>
       </div>
+      <div style="margin-top:6px;padding:6px 8px;background:var(--surface2);border-radius:var(--radius-sm);display:flex;justify-content:space-between;align-items:center">
+        <span style="font-size:10px;color:var(--text2)">\u2316 Sun Position Error</span>
+        <span id="sun-error-value" style="font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text3)">\u2014</span>
+      </div>
       ${sunInfo}
     </div>
   `;
@@ -458,11 +467,14 @@ function setupCanvas(photo) {
   const cached = _imgCache.get(photo.id);
   if (cached && cached.complete && cached.naturalWidth > 0) {
     _img = cached;
+    // Init sun disc if switching photos
+    if (_isFisheye) { _sunDisc = null; initSunDisc(); }
     // redraw() will be called by the caller
   } else {
     _img = new Image();
     _img.onload = () => {
       _imgCache.set(photo.id, _img);
+      if (_isFisheye) { _sunDisc = null; initSunDisc(); }
       redraw();
     };
     _img.src = photo.dataUrl || '';
@@ -610,6 +622,154 @@ function canvasToSky(cx, cy) {
 // Drawing / rendering
 // ============================================================
 
+/**
+ * Get image pixel luminance data from the visible canvas.
+ * Renders the image alone onto a temp canvas and returns ImageData.
+ */
+function getImagePixels() {
+  if (!_img || !_img.complete || !_img.naturalWidth) return null;
+  const W = _canvas.width, H = _canvas.height;
+  const tmp = document.createElement('canvas');
+  tmp.width = W; tmp.height = H;
+  const tctx = tmp.getContext('2d');
+  if (_isFisheye) {
+    tctx.drawImage(_img, 0, 0, W, H);
+  } else {
+    tctx.drawImage(_img, 0, 0, _img.naturalWidth, _img.naturalHeight / 2, 0, 0, W, H);
+  }
+  return tctx.getImageData(0, 0, W, H);
+}
+
+/**
+ * Find the brightest region in the image for initial sun disc placement.
+ * Uses a coarse grid scan with a box blur kernel, then refines.
+ */
+function findBrightestRegion(imgData, W, H, searchRadius) {
+  const d = imgData.data;
+  const step = Math.max(2, Math.floor(searchRadius / 3));
+  let bestX = W / 2, bestY = H / 2, bestVal = -1;
+  const cx = W / 2, cy = H / 2, maxR = W / 2;
+
+  for (let y = searchRadius; y < H - searchRadius; y += step) {
+    for (let x = searchRadius; x < W - searchRadius; x += step) {
+      // For fisheye, skip outside the circle
+      if (_isFisheye) {
+        const dx = x - cx, dy = y - cy;
+        if (dx * dx + dy * dy > maxR * maxR) continue;
+      }
+      // Average luminance in a small box
+      let sum = 0, count = 0;
+      const hs = Math.floor(searchRadius / 2);
+      for (let dy = -hs; dy <= hs; dy += 2) {
+        for (let dx = -hs; dx <= hs; dx += 2) {
+          const idx = ((y + dy) * W + (x + dx)) * 4;
+          sum += d[idx] * 0.299 + d[idx + 1] * 0.587 + d[idx + 2] * 0.114;
+          count++;
+        }
+      }
+      const avg = sum / count;
+      if (avg > bestVal) { bestVal = avg; bestX = x; bestY = y; }
+    }
+  }
+  return { x: bestX, y: bestY };
+}
+
+/**
+ * Gradient-descent-like search to find the brightest point within a disc.
+ * Uses luminance with Gaussian weighting toward center.
+ */
+function findSunCenter(imgData, W, discCx, discCy, discR) {
+  const d = imgData.data;
+  const r = Math.max(5, Math.floor(discR));
+
+  // First: find the peak pixel in the disc
+  let bestX = discCx, bestY = discCy, bestLum = -1;
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx * dx + dy * dy > r * r) continue;
+      const px = Math.round(discCx + dx), py = Math.round(discCy + dy);
+      if (px < 0 || px >= W || py < 0) continue;
+      const idx = (py * W + px) * 4;
+      const lum = d[idx] * 0.299 + d[idx + 1] * 0.587 + d[idx + 2] * 0.114;
+      if (lum > bestLum) { bestLum = lum; bestX = px; bestY = py; }
+    }
+  }
+
+  // Refine: weighted centroid of pixels within 90% of peak luminance
+  const threshold = bestLum * 0.90;
+  let wx = 0, wy = 0, wt = 0;
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx * dx + dy * dy > r * r) continue;
+      const px = Math.round(discCx + dx), py = Math.round(discCy + dy);
+      if (px < 0 || px >= W || py < 0) continue;
+      const idx = (py * W + px) * 4;
+      const lum = d[idx] * 0.299 + d[idx + 1] * 0.587 + d[idx + 2] * 0.114;
+      if (lum >= threshold) {
+        const w = lum * lum;  // weight brighter pixels more
+        wx += px * w; wy += py * w; wt += w;
+      }
+    }
+  }
+  if (wt > 0) { bestX = wx / wt; bestY = wy / wt; }
+  return { x: bestX, y: bestY };
+}
+
+/**
+ * Initialize the sun disc from the brightest region, or recalc found position.
+ */
+function initSunDisc() {
+  const imgData = getImagePixels();
+  if (!imgData) return;
+  const W = _canvas.width, H = _canvas.height;
+  const defaultR = Math.round(W * 0.06);  // ~48px on 800px canvas
+
+  if (!_sunDisc) {
+    const bright = findBrightestRegion(imgData, W, H, defaultR);
+    _sunDisc = { cx: bright.x, cy: bright.y, r: defaultR, foundX: 0, foundY: 0 };
+  }
+  const found = findSunCenter(imgData, W, _sunDisc.cx, _sunDisc.cy, _sunDisc.r);
+  _sunDisc.foundX = found.x;
+  _sunDisc.foundY = found.y;
+}
+
+/**
+ * Recompute found sun center (after drag/resize) without reinitializing disc position.
+ */
+function updateSunFound() {
+  const imgData = getImagePixels();
+  if (!imgData || !_sunDisc) return;
+  const found = findSunCenter(imgData, _canvas.width, _sunDisc.cx, _sunDisc.cy, _sunDisc.r);
+  _sunDisc.foundX = found.x;
+  _sunDisc.foundY = found.y;
+}
+
+/**
+ * Compute angular error between the found sun pixel and the computed sun position.
+ * Returns degrees, or null if either is unavailable.
+ */
+function computeSunError() {
+  if (!_sunDisc || !_isFisheye) return null;
+  const photo = getState().photos[_photoId];
+  if (!photo?.metadata?.datetime) return null;
+  const state = getState();
+  if (state.location.lat == null) return null;
+
+  const sp = sunPositionAtTime(photo.metadata.datetime, state.location.lat, state.location.lon);
+  if (!sp || sp.elevation <= 0) return null;
+
+  // Found sun → sky coords
+  const foundSky = canvasToSky(_sunDisc.foundX, _sunDisc.foundY);
+  if (!foundSky || foundSky.valid === false) return null;
+
+  // Angular distance using spherical law of cosines
+  const D = Math.PI / 180;
+  const el1 = sp.elevation * D, az1 = sp.azimuth * D;
+  const el2 = foundSky.elevation * D, az2 = foundSky.azimuth * D;
+  const cosD = Math.sin(el1) * Math.sin(el2) + Math.cos(el1) * Math.cos(el2) * Math.cos(az1 - az2);
+  return Math.acos(Math.max(-1, Math.min(1, cosD))) / D;
+}
+
 function redraw() {
   if (!_ctx || !_canvas) return;
   const W = _canvas.width, H = _canvas.height;
@@ -670,7 +830,58 @@ function redraw() {
     _ctx.restore();
   }
 
+  // Sun finder disc overlay
+  if (_sunDisc && _isFisheye) {
+    _ctx.save();
+    // Semi-transparent yellow disc
+    _ctx.beginPath();
+    _ctx.arc(_sunDisc.cx, _sunDisc.cy, _sunDisc.r, 0, Math.PI * 2);
+    _ctx.fillStyle = 'rgba(255, 240, 120, 0.15)';
+    _ctx.fill();
+    _ctx.strokeStyle = 'rgba(255, 220, 60, 0.5)';
+    _ctx.lineWidth = 1.5;
+    _ctx.setLineDash([4, 4]);
+    _ctx.stroke();
+    _ctx.setLineDash([]);
+
+    // X marker at found sun center
+    const fx = _sunDisc.foundX, fy = _sunDisc.foundY;
+    const xSize = 6;
+    _ctx.strokeStyle = '#ff3333';
+    _ctx.lineWidth = 2;
+    _ctx.beginPath();
+    _ctx.moveTo(fx - xSize, fy - xSize); _ctx.lineTo(fx + xSize, fy + xSize);
+    _ctx.moveTo(fx + xSize, fy - xSize); _ctx.lineTo(fx - xSize, fy + xSize);
+    _ctx.stroke();
+
+    // Small label
+    _ctx.fillStyle = 'rgba(255, 220, 60, 0.8)';
+    _ctx.font = '9px "JetBrains Mono", monospace';
+    _ctx.textAlign = 'center';
+    _ctx.fillText('sun', _sunDisc.cx, _sunDisc.cy - _sunDisc.r - 4);
+    _ctx.restore();
+  }
+
+  // Update sun error display in sidebar
+  updateSunErrorDisplay();
+
   updateHorizonMini();
+}
+
+/**
+ * Update the sun error readout in the sidebar.
+ */
+function updateSunErrorDisplay() {
+  const el = qs('#sun-error-value', _container);
+  if (!el) return;
+  const err = computeSunError();
+  if (err != null) {
+    el.textContent = err.toFixed(1) + '°';
+    el.style.color = err < 3 ? 'var(--gain)' : err < 8 ? 'var(--sun)' : 'var(--loss)';
+  } else {
+    el.textContent = '—';
+    el.style.color = 'var(--text3)';
+  }
 }
 
 function drawGrid(W, H) {
@@ -1230,8 +1441,19 @@ function bindCanvasEvents() {
 
   _canvas.addEventListener('mousedown', (e) => {
     e.preventDefault();
-    _isPainting = true;
     const { cx, cy } = getPos(e);
+
+    // Check if clicking on sun disc
+    if (_sunDisc && _isFisheye) {
+      const dx = cx - _sunDisc.cx, dy = cy - _sunDisc.cy;
+      if (dx * dx + dy * dy <= _sunDisc.r * _sunDisc.r) {
+        _draggingSun = true;
+        _sunDragOffset = { dx: _sunDisc.cx - cx, dy: _sunDisc.cy - cy };
+        return;
+      }
+    }
+
+    _isPainting = true;
     paintAt(cx, cy);
     _lastPaintPos = { x: cx, y: cy };
     redraw();
@@ -1239,6 +1461,14 @@ function bindCanvasEvents() {
 
   _canvas.addEventListener('mousemove', (e) => {
     const { cx, cy } = getPos(e);
+
+    if (_draggingSun && _sunDisc) {
+      _sunDisc.cx = cx + _sunDragOffset.dx;
+      _sunDisc.cy = cy + _sunDragOffset.dy;
+      updateSunFound();
+      redraw();
+      return;
+    }
 
     if (_isPainting && _lastPaintPos) {
       paintLine(_lastPaintPos.x, _lastPaintPos.y, cx, cy);
@@ -1257,6 +1487,11 @@ function bindCanvasEvents() {
   });
 
   _canvas.addEventListener('mouseup', () => {
+    if (_draggingSun) {
+      _draggingSun = false;
+      _sunDragOffset = null;
+      return;
+    }
     if (_isPainting) {
       _isPainting = false;
       debouncedSave();
@@ -1264,6 +1499,10 @@ function bindCanvasEvents() {
   });
 
   _canvas.addEventListener('mouseleave', () => {
+    if (_draggingSun) {
+      _draggingSun = false;
+      _sunDragOffset = null;
+    }
     if (_isPainting) {
       _isPainting = false;
       debouncedSave();
@@ -1272,9 +1511,21 @@ function bindCanvasEvents() {
     redraw();
   });
 
-  // Scroll wheel = brush size
+  // Scroll wheel: sun disc resize if hovering over disc, else brush size
   _canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
+    const { cx, cy } = getPos(e);
+
+    if (_sunDisc && _isFisheye) {
+      const dx = cx - _sunDisc.cx, dy = cy - _sunDisc.cy;
+      if (dx * dx + dy * dy <= (_sunDisc.r + 10) * (_sunDisc.r + 10)) {
+        _sunDisc.r = Math.max(10, Math.min(200, _sunDisc.r + (e.deltaY > 0 ? -4 : 4)));
+        updateSunFound();
+        redraw();
+        return;
+      }
+    }
+
     _brushSize = Math.max(5, Math.min(150, _brushSize + (e.deltaY > 0 ? -3 : 3)));
     const slider = qs('#rng-brush-size', _container);
     if (slider) slider.value = _brushSize;
