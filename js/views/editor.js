@@ -11,7 +11,7 @@ import {
   el, qs, qsa, clearEl, imageToSky, skyToImage,
   buildFisheyeRotation, skyToFisheye, fisheyeToSky,
   sunPositionAtTime, maskLookupToHorizon, buildSkyMaskLookup,
-  decodeMaskDataUrl, debounce
+  decodeMaskDataUrl, debounce, normalizeFisheyeFov
 } from '../utils.js';
 import { computeAllSunPaths, sunPosition, solarDeclination, MONTHS } from '../solar-engine.js';
 
@@ -316,7 +316,7 @@ function setupCanvas(photo) {
   if (_isFisheye && photo.fisheye) {
     const ori = photo.orientation || {};
     const sys = getState().system;
-    _fov = photo.fisheye.fov || 90;
+    _fov = normalizeFisheyeFov(photo.fisheye.fov);
     _worldToCamera = buildFisheyeRotation(
       ori.panelAzimuth ?? sys.azimuth,
       ori.panelTilt ?? sys.tilt,
@@ -435,7 +435,7 @@ function getOrientation() {
 function rebuildFisheyeTransform() {
   const o = getOrientation();
   const photo = getState().photos[_photoId];
-  _fov = photo?.fisheye?.fov || 90;
+  _fov = normalizeFisheyeFov(photo?.fisheye?.fov);
   _worldToCamera = buildFisheyeRotation(o.panelAz, o.panelTilt, o.clockAngle);
 }
 

@@ -992,6 +992,25 @@ export async function decodeMaskDataUrl(dataUrl) {
 }
 
 /**
+ * Normalize a fisheye FOV value to half-angle in degrees.
+ * INSP trailer may store the value in radians, as full-FOV, or as half-FOV.
+ * @param {number|null|undefined} fov - raw FOV value from calibration
+ * @returns {number} half-angle FOV in degrees (typically ~90 for 180° Insta360 lenses)
+ */
+export function normalizeFisheyeFov(fov) {
+  if (fov == null || fov <= 0) return 90;
+  if (fov < 10) {
+    // Likely in radians (e.g. π/2 ≈ 1.5708 for 90° half-angle)
+    fov = fov * 180 / Math.PI;
+  } else if (fov > 120) {
+    // Likely full FOV in degrees (e.g. 200° → half = 100°)
+    fov = fov / 2;
+  }
+  // Clamp to reasonable range for fisheye lenses
+  return Math.max(70, Math.min(110, fov));
+}
+
+/**
  * Build a shade lookup function from a photo and its decoded mask pixel data.
  * Returns (az, el) => boolean — true means the sun at (az, el) is shaded (ground).
  *
@@ -1010,25 +1029,37 @@ export function buildSkyMaskLookup(photo, maskData, systemDefaults = {}) {
     const panelTilt = ori.panelTilt ?? systemDefaults.tilt ?? 30;
     const clockAngle = ori.clockAngle ?? photo.fisheye.accelClockAngle ?? 0;
     const worldToCamera = buildFisheyeRotation(panelAz, panelTilt, clockAngle);
-    const fov = photo.fisheye.fov || 90;
+    const fov = normalizeFisheyeFov(photo.fisheye.fov);
     const imgSize = Math.min(width, height);
+    const D = Math.PI / 180;
 
     return (az, el) => {
       const fp = skyToFisheye(az, el, worldToCamera, imgSize, fov);
-      if (!fp.visible) return false;
+      if (!fp.visible) {
+        // Direction is outside camera FOV.
+        // If it's behind the panel plane (below panel surface), it's physically
+        // blocked by the panel/roof structure → treat as shaded.
+        const cosEl = Math.cos(el * D), sinEl = Math.sin(el * D);
+        const wx = cosEl * Math.sin(az * D);
+        const wy = cosEl * Math.cos(az * D);
+        const wz = sinEl;
+        return worldToCamera(wx, wy, wz).cz <= 0;
+      }
       const ix = Math.max(0, Math.min(width - 1, Math.round(fp.x)));
       const iy = Math.max(0, Math.min(height - 1, Math.round(fp.y)));
       return data[(iy * width + ix) * 4 + 3] > 128;
     };
   } else {
-    // Equirectangular
+    // Equirectangular — mask canvas represents upper hemisphere only
+    // (elevation 0° at bottom, 90° at top), so yNorm 0..0.5 maps to full canvas height
     const heading = photo.metadata?.compassHeading ?? 180;
     const pitch = photo.metadata?.pitch ?? 0;
 
     return (az, el) => {
       const norm = skyToImage(az, el, heading, pitch);
       const ix = Math.round(norm.x * (width - 1));
-      const iy = Math.round(norm.y * (height - 1));
+      // Map yNorm (0..0.5 for upper hemisphere) to full canvas height
+      const iy = Math.round((norm.y / 0.5) * (height - 1));
       if (ix < 0 || ix >= width || iy < 0 || iy >= height) return false;
       return data[(iy * width + ix) * 4 + 3] > 128;
     };

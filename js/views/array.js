@@ -12,7 +12,7 @@ import {
 } from '../state.js';
 import {
   el, qs, qsa, clearEl, parsePhotoMetadata, loadImage, fmtLatLon, fmtDeg,
-  isInspFile, loadInspHalves, accelToOrientation
+  isInspFile, loadInspHalves, accelToOrientation, normalizeFisheyeFov
 } from '../utils.js';
 
 // ─── Constants ────────────────────────────────────────
@@ -822,7 +822,7 @@ async function processInspFile(file, assignToSelected) {
     // Determine lens calibration for the selected half
     const cal = halves.calibration;
     const lens = cal ? (selectedHalf.side === 'left' ? cal.lens1 : cal.lens2) : null;
-    const fov = lens?.fov || 90;
+    const fov = normalizeFisheyeFov(lens?.fov);
 
     // Derive tilt/clock-angle from accelerometer if available
     const accelOri = accelToOrientation(halves.accel);

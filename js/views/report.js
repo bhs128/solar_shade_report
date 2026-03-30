@@ -4,7 +4,7 @@
  * monthly/hourly tables, scenario comparison, and array heatmap.
  */
 
-import { getState, setState, getSubPanels, getMergedHorizon } from '../state.js';
+import { getState, setState, getSubPanels } from '../state.js';
 import {
   el, qs, qsa, clearEl, savColor, fmtPct, fmtNum, fmtDeg, fmtLatLon,
   maskLookupToHorizon
@@ -692,16 +692,21 @@ function drawHeatmapBase() {
   ctx.imageSmoothingEnabled = true;
   ctx.drawImage(tmp, pad.l, pad.t, dw, dh);
 
-  // Horizon outlines (all points, faint)
+  // Horizon outlines — use freshly computed sub-horizons (not stored profiles
+  // which may be stale if FOV was previously miscalculated)
   const state = getState();
-  const pts = Object.values(state.points);
-  const scn = state.activeScenario;
-  for (const pt of pts) {
-    const h = getMergedHorizon([pt.id], scn);
+  if (_subHorizons && _subHorizons.length > 0) {
+    // Aggregate: max elevation across all sub-panel horizons
+    const aggH = new Float32Array(360);
+    for (const h of _subHorizons) {
+      for (let az = 0; az < 360; az++) {
+        if (h[az] > aggH[az]) aggH[az] = h[az];
+      }
+    }
     ctx.beginPath();
     for (let az = azMin; az < azMax; az++) {
       const x = pad.l + ((az - azMin) / (azMax - azMin)) * dw;
-      const y = pad.t + dh * (1 - h[az] / elMax);
+      const y = pad.t + dh * (1 - aggH[az] / elMax);
       az === azMin ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
     }
     ctx.strokeStyle = 'rgba(0,0,0,0.25)';
