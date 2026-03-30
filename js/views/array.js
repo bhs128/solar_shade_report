@@ -704,7 +704,19 @@ function updatePointPanel() {
 
 function photoDetailHTML(photo) {
   const meta = photo.metadata;
+  const fe = photo.fisheye || {};
   const traceCount = Object.values(photo.traces).reduce((n, t) => n + ((t.paths.length > 0 || t.groundMask) ? 1 : 0), 0);
+
+  // Orientation summary
+  let oriHTML = '';
+  if (fe.accelTilt != null || fe.rotationMatrix) {
+    const parts = [];
+    if (fe.accelTilt != null) parts.push(`Tilt ${fe.accelTilt.toFixed(1)}°`);
+    if (fe.accelClockAngle != null) parts.push(`Clock ${fe.accelClockAngle.toFixed(1)}°`);
+    if (fe.rotationMatrix) parts.push('Rot\u2713');
+    oriHTML = `<div style="color:var(--text2);margin-top:2px;font-size:11px">\u2316 ${parts.join(' · ')}</div>`;
+  }
+
   return `
     <div style="border-top:1px solid var(--border);padding-top:12px">
       <h3 style="font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px">
@@ -718,6 +730,7 @@ function photoDetailHTML(photo) {
         ${meta.compassHeading != null
           ? `<div style="color:var(--gain)">Heading: ${meta.compassHeading.toFixed(1)}\u00B0</div>`
           : '<div style="color:var(--sun)">No compass heading</div>'}
+        ${oriHTML}
         <div style="color:var(--text3);margin-top:2px">${traceCount} trace(s) drawn</div>
       </div>
       <div style="display:flex;gap:6px;margin-top:10px">
@@ -860,6 +873,9 @@ async function processInspFile(file, assignToSelected) {
         accelClockAngle: accelOri.valid ? accelOri.clockAngle : null,
         lensSide: selectedHalf.side,
         calibration: lens,
+        rotationMatrix: cal?.rotationMatrix || null,
+        gyro: halves.accel ? { gx: halves.accel.gx, gy: halves.accel.gy, gz: halves.accel.gz } : null,
+        rawAccel: halves.accel,
       },
       coveragePoints: assignToSelected && _selectedPtId ? [_selectedPtId] : [],
     });
@@ -981,9 +997,11 @@ function buildPhotoList() {
 
     const info = el('div');
     info.style.cssText = 'min-width:0;overflow:hidden';
+    const fe = photo.fisheye || {};
+    const oriTag = fe.accelTilt != null ? ` · ${fe.accelTilt.toFixed(0)}°` : '';
     info.innerHTML = `
       <div style="font-size:10px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(photo.filename)}</div>
-      <div style="font-size:9px;color:var(--text3);margin-top:1px">${photo.coveragePoints.length} pt(s)</div>
+      <div style="font-size:9px;color:var(--text3);margin-top:1px">${photo.coveragePoints.length} pt(s)${oriTag}</div>
     `;
     thumb.appendChild(info);
 

@@ -310,8 +310,49 @@ export function isInspFile(file) {
 }
 
 /**
+ * Read a protobuf varint from a Uint8Array at the given offset.
+ * Returns { value, next } or null if invalid.
+ */
+function readVarint(data, offset) {
+  let result = 0, shift = 0;
+  while (offset < data.length) {
+    const b = data[offset++];
+    result |= (b & 0x7F) << shift;
+    if (!(b & 0x80)) return { value: result >>> 0, next: offset };
+    shift += 7;
+    if (shift > 35) return null;
+  }
+  return null;
+}
+
+/**
+ * Extract Field 60 (rotation matrix) from protobuf trailer bytes.
+ * Field 60, wire type 5 (32-bit) → tag varint = (60<<3)|5 = 485 → bytes 0xE5 0x03.
+ * Returns a 3×3 array or null.
+ */
+function parseProtobufRotationMatrix(trailer) {
+  const floats = [];
+  for (let i = 0; i < trailer.length - 5; i++) {
+    if (trailer[i] === 0xE5 && trailer[i + 1] === 0x03) {
+      const view = new DataView(trailer.buffer, trailer.byteOffset + i + 2, 4);
+      floats.push(view.getFloat32(0, true));
+      i += 5; // skip tag(2) + float(4) - 1 (loop increments)
+    }
+  }
+  if (floats.length === 9) {
+    return [
+      [floats[0], floats[1], floats[2]],
+      [floats[3], floats[4], floats[5]],
+      [floats[6], floats[7], floats[8]],
+    ];
+  }
+  return null;
+}
+
+/**
  * Parse the Insta360 proprietary binary trailer appended after JPEG data.
- * Returns lens calibration parameters for both fisheye lenses.
+ * Returns lens calibration parameters for both fisheye lenses,
+ * plus the Field 60 rotation matrix (gyro-stabilized camera orientation).
  */
 function parseInspTrailer(arrayBuffer) {
   const data = new Uint8Array(arrayBuffer);
@@ -336,6 +377,12 @@ function parseInspTrailer(arrayBuffer) {
   const parts = calMatch[1].split('_');
   if (parts.length < 15) return null;
 
+  // Extract Field 60 rotation matrix from protobuf trailer
+  const rotationMatrix = parseProtobufRotationMatrix(trailer);
+  if (rotationMatrix) {
+    console.log('[SolarScope] Rotation matrix (Field 60):', rotationMatrix);
+  }
+
   return {
     lens1: {
       cx: parseFloat(parts[1]),
@@ -355,6 +402,7 @@ function parseInspTrailer(arrayBuffer) {
     },
     rawWidth: parseInt(parts[13]),
     rawHeight: parseInt(parts[14]),
+    rotationMatrix,
   };
 }
 

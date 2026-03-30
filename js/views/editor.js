@@ -236,6 +236,9 @@ function buildFisheyeOrientationUI(photo) {
   // Build reference rows info
   const accelTilt = fe.accelTilt != null ? fe.accelTilt.toFixed(1) + '°' : '—';
   const accelClk = fe.accelClockAngle != null ? fe.accelClockAngle.toFixed(1) + '°' : '—';
+  const hasGyro = fe.gyro && (fe.gyro.gx !== 0 || fe.gyro.gy !== 0 || fe.gyro.gz !== 0);
+  const gyroTag = hasGyro ? ' <span title="Gyroscope data available" style="color:var(--gain)">&#8982;</span>' : '';
+  const rotTag = fe.rotationMatrix ? ' <span title="Rotation matrix (Field 60)" style="color:var(--gain)">&#9724;</span>' : '';
 
   // Sun position from EXIF
   let sunInfo = '';
@@ -250,7 +253,7 @@ function buildFisheyeOrientationUI(photo) {
     <div class="card" style="padding:12px">
       <h2 style="margin-bottom:8px">Orientation</h2>
       <table style="width:100%;font-size:10px;color:var(--text2);border-collapse:collapse">
-        <tr><th style="text-align:left;padding:2px 4px"></th><th style="padding:2px 4px">Setup</th><th style="padding:2px 4px">Accel</th><th style="padding:2px 4px">Slider</th></tr>
+        <tr><th style="text-align:left;padding:2px 4px"></th><th style="padding:2px 4px">Setup</th><th style="padding:2px 4px">Accel${gyroTag}${rotTag}</th><th style="padding:2px 4px">Slider</th></tr>
         <tr>
           <td style="padding:2px 4px">Tilt</td>
           <td style="text-align:center;padding:2px 4px">${sys.tilt}°</td>
