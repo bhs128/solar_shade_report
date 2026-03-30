@@ -407,35 +407,83 @@ function parseInspTrailer(arrayBuffer) {
 }
 
 /**
- * Parse the Insta360 MakerNote to extract accelerometer data.
- * Returns { ax, ay, az, gx, gy, gz } or null.
+ * Extract the raw MakerNote (EXIF tag 0x927C) bytes directly from a JPEG ArrayBuffer.
+ * Walks JPEG APP1 → TIFF IFD0 → ExifIFD → MakerNote without relying on exifr.
+ * Returns a Uint8Array of the MakerNote payload, or null.
  */
-async function parseInspAccelerometer(file) {
-  const exifr = await loadExifr();
-  if (!exifr) return null;
-  try {
-    const parsed = await exifr.parse(file, {
-      tiff: true, exif: true,    // MakerNote (0x927C) lives in ExifIFD, not IFD0
-      translateValues: false,
-      mergeOutput: true,
-    });
-    const mn = parsed?.MakerNote;
-    if (!mn) {
-      console.warn('[SolarScope] MakerNote not found in EXIF data');
+function extractMakerNote(arrayBuffer) {
+  const data = new Uint8Array(arrayBuffer);
+  const view = new DataView(arrayBuffer);
+  if (data[0] !== 0xFF || data[1] !== 0xD8) return null; // not JPEG
+
+  // Find APP1 (EXIF) segment
+  let pos = 2;
+  while (pos < data.length - 4) {
+    if (data[pos] !== 0xFF) break;
+    const marker = data[pos + 1];
+    const segLen = view.getUint16(pos + 2, false);
+    if (marker === 0xE1 &&
+        data[pos + 4] === 0x45 && data[pos + 5] === 0x78 &&
+        data[pos + 6] === 0x69 && data[pos + 7] === 0x66 &&
+        data[pos + 8] === 0x00 && data[pos + 9] === 0x00) {
+      // TIFF header at pos+10
+      const tiffBase = pos + 10;
+      const le = data[tiffBase] === 0x49; // 'II' = little-endian
+
+      // IFD0
+      const ifd0Off = view.getUint32(tiffBase + 4, le);
+      let p = tiffBase + ifd0Off;
+      const ifd0Count = view.getUint16(p, le);
+      p += 2;
+      let exifOff = 0;
+      for (let i = 0; i < ifd0Count; i++) {
+        if (view.getUint16(p, le) === 0x8769) { exifOff = view.getUint32(p + 8, le); break; }
+        p += 12;
+      }
+      if (!exifOff) return null;
+
+      // ExifIFD — find tag 0x927C (MakerNote)
+      p = tiffBase + exifOff;
+      const exifCount = view.getUint16(p, le);
+      p += 2;
+      for (let i = 0; i < exifCount; i++) {
+        if (view.getUint16(p, le) === 0x927C) {
+          const count = view.getUint32(p + 4, le);
+          const offset = count <= 4 ? p + 8 : tiffBase + view.getUint32(p + 8, le);
+          return new Uint8Array(arrayBuffer, offset, count);
+        }
+        p += 12;
+      }
       return null;
     }
-    const bytes = mn instanceof Uint8Array ? mn : new Uint8Array(mn);
-    let end = bytes.length;
-    for (let i = 0; i < bytes.length; i++) {
-      if (bytes[i] < 0x20 && bytes[i] !== 0x2D) { end = i; break; }
+    pos += 2 + segLen;
+  }
+  return null;
+}
+
+/**
+ * Parse the Insta360 MakerNote to extract accelerometer data.
+ * Reads tag 0x927C directly from the JPEG EXIF structure.
+ * Returns { ax, ay, az, gx, gy, gz } or null.
+ */
+function parseInspAccelerometer(arrayBuffer) {
+  try {
+    const mn = extractMakerNote(arrayBuffer);
+    if (!mn) {
+      console.warn('[SolarScope] MakerNote tag 0x927C not found in EXIF');
+      return null;
     }
-    const ascii = new TextDecoder('ascii').decode(bytes.slice(0, end));
+    let end = mn.length;
+    for (let i = 0; i < mn.length; i++) {
+      if (mn[i] < 0x20 && mn[i] !== 0x2D) { end = i; break; }
+    }
+    const ascii = new TextDecoder('ascii').decode(mn.slice(0, end));
     const vals = ascii.split('_').map(Number);
     if (vals.length >= 6 && vals.every(v => !isNaN(v))) {
       console.log('[SolarScope] Accelerometer parsed:', { ax: vals[0], ay: vals[1], az: vals[2], gx: vals[3], gy: vals[4], gz: vals[5] });
       return { ax: vals[0], ay: vals[1], az: vals[2], gx: vals[3], gy: vals[4], gz: vals[5] };
     }
-    console.warn('[SolarScope] MakerNote found but could not parse accel data. First 60 bytes:', ascii.slice(0, 60));
+    console.warn('[SolarScope] MakerNote found but could not parse accel. First 60 bytes:', ascii.slice(0, 60));
   } catch (e) {
     console.warn('[SolarScope] Error parsing MakerNote accelerometer:', e.message);
   }
@@ -452,7 +500,7 @@ export async function loadInspHalves(file) {
   const arrayBuffer = await file.arrayBuffer();
   const calibration = parseInspTrailer(arrayBuffer);
 
-  const accel = await parseInspAccelerometer(file);
+  const accel = parseInspAccelerometer(arrayBuffer);
   const metadata = await parsePhotoMetadata(file);
 
   // Load as image
