@@ -8,16 +8,17 @@ import {
   getState, setState, addPhoto, assignPhotoToPoints,
   removePhoto, subscribe,
   addMeasurementPoint, removeMeasurementPoint,
-  moveMeasurementPoint, renameMeasurementPoint
+  moveMeasurementPoint, renameMeasurementPoint, getCoverageForPoints, pointMeters
 } from '../state.js';
 import {
   el, qs, qsa, clearEl, parsePhotoMetadata, loadImage, fmtLatLon, fmtDeg,
-  isInspFile, loadInspHalves, accelToOrientation, normalizeFisheyeFov
+  isInspFile, loadInspHalves, accelToOrientation, normalizeFisheyeFov,
+  reprojectMaskToPhoto
 } from '../utils.js';
 
 // ─── Constants ────────────────────────────────────────
 const PAD = 30;
-const GAP = 4;
+const GAP = 4; // fallback gutter (px) when panelGap is 0
 const PT_R = 7;
 const MIN_PANEL_W = 28;
 const SNAP_PX = 12;
@@ -35,6 +36,7 @@ let _panelW = 0;
 let _panelH = 0;
 let _originX = 0;
 let _originY = 0;
+let _gapPx = GAP; // physical inter-panel gutter, in pixels (both axes)
 
 // Interaction
 let _selectedPtId = null;
@@ -75,7 +77,7 @@ function buildUI() {
         </div>
         <p class="hint" style="margin-bottom:8px">
           Click <strong>+ Add Point</strong> to create measurement points.
-          Drag to position—snaps to center, edges &amp; corners. Select a point to assign a photo.
+          Drag to position—snaps to center, edges, corners &amp; panel intersections. Select a point to assign a photo.
         </p>
         <div id="canvas-wrap" style="position:relative;width:100%;background:var(--surface2);border-radius:var(--radius-sm);overflow:hidden">
           <canvas id="array-canvas" style="display:block;width:100%"></canvas>
@@ -154,27 +156,33 @@ function initCanvas() {
 
 function computeLayout() {
   const state = getState();
-  const { rows, cols, panelWidth, panelHeight } = state.system;
+  const { rows, cols, panelWidth, panelHeight, panelGap } = state.system;
   const wrap = _canvas.parentElement;
   const wrapW = wrap.clientWidth;
 
   const aspect = panelHeight / panelWidth;
-  const availW = wrapW - 2 * PAD - (cols - 1) * GAP;
-  _panelW = Math.max(MIN_PANEL_W, availW / cols);
+  // Physical gap as a fraction of panel width. The canvas scale is uniform
+  // (same pixels-per-metre on both axes), so one gap value works for rows & cols.
+  const k = (panelGap > 0 && panelWidth > 0) ? panelGap / panelWidth : 0;
+  const availW = wrapW - 2 * PAD;
+  // availW = cols*panelW + (cols-1)*gapPx, with gapPx = panelW*k.
+  _panelW = Math.max(MIN_PANEL_W, availW / (cols + (cols - 1) * k));
   _panelH = _panelW * aspect;
+  _gapPx = k > 0 ? _panelW * k : GAP;
 
   // Cap grid height
-  const gridH = rows * _panelH + (rows - 1) * GAP;
+  const gridH = rows * _panelH + (rows - 1) * _gapPx;
   if (gridH > 500) {
     const scale = 500 / gridH;
     _panelH *= scale;
     _panelW *= scale;
+    _gapPx *= scale;
   }
 
-  _originX = (wrapW - (cols * _panelW + (cols - 1) * GAP)) / 2;
+  _originX = (wrapW - (cols * _panelW + (cols - 1) * _gapPx)) / 2;
   _originY = PAD;
 
-  const canvasH = _originY + rows * _panelH + (rows - 1) * GAP + PAD;
+  const canvasH = _originY + rows * _panelH + (rows - 1) * _gapPx + PAD;
   _canvas.width = Math.round(wrapW * _dpr);
   _canvas.height = Math.round(canvasH * _dpr);
   _canvas.style.height = canvasH + 'px';
@@ -185,16 +193,30 @@ function computeLayout() {
 
 function pRect(row, col) {
   return {
-    x: _originX + col * (_panelW + GAP),
-    y: _originY + row * (_panelH + GAP),
+    x: _originX + col * (_panelW + _gapPx),
+    y: _originY + row * (_panelH + _gapPx),
     w: _panelW,
     h: _panelH,
   };
 }
 
+/**
+ * Pixel offset that pushes an edge/junction position into the centre of the
+ * physical gutter, so intersection snaps render between panels rather than at
+ * a single panel's corner. Interior positions (0<l<1) are unaffected.
+ */
+function gutterShift(lx, ly) {
+  const h = _gapPx / 2;
+  return {
+    sx: lx === 1 ? h : lx === 0 ? -h : 0,
+    sy: ly === 1 ? h : ly === 0 ? -h : 0,
+  };
+}
+
 function ptCanvasXY(pt) {
   const r = pRect(pt.panelRow, pt.panelCol);
-  return { cx: r.x + pt.localX * r.w, cy: r.y + pt.localY * r.h };
+  const { sx, sy } = gutterShift(pt.localX, pt.localY);
+  return { cx: r.x + pt.localX * r.w + sx, cy: r.y + pt.localY * r.h + sy };
 }
 
 function drawArray() {
@@ -206,10 +228,16 @@ function drawArray() {
 
   _ctx.clearRect(0, 0, w, h);
 
+  // Panels meeting at a point (selected, else hovered) are all highlighted —
+  // a junction/edge point is genuinely used by every adjacent panel.
+  const hiPtId = (_selectedPtId && state.points[_selectedPtId]) ? _selectedPtId
+    : (_hoveredPtId && state.points[_hoveredPtId]) ? _hoveredPtId : null;
+  const coverage = hiPtId ? getCoverageForPoints([hiPtId]) : null;
+
   // Panels
   for (let r = 0; r < rows; r++)
     for (let c = 0; c < cols; c++)
-      drawPanel(r, c, state);
+      drawPanel(r, c, state, coverage);
 
   // Snap targets (while dragging)
   if (_dragging && _dragCurrentPanel) {
@@ -220,7 +248,7 @@ function drawArray() {
   drawPoints(state);
 }
 
-function drawPanel(row, col, state) {
+function drawPanel(row, col, state, coverage) {
   const { x, y, w, h } = pRect(row, col);
   const { diodeSplit, diodeSubsections } = state.system;
   const pts = Object.values(state.points).filter(p => p.panelRow === row && p.panelCol === col);
@@ -231,10 +259,8 @@ function drawPanel(row, col, state) {
     return ph && Object.values(ph.traces).some(t => t.paths.length > 0 || t.groundMask);
   });
 
-  // Selected-point panel highlight
-  const isSelectedPanel = _selectedPtId && state.points[_selectedPtId]
-    && state.points[_selectedPtId].panelRow === row
-    && state.points[_selectedPtId].panelCol === col;
+  // Panel uses the highlighted point if any of its sub-panels reference it.
+  const isSelectedPanel = !!coverage && coverage.panelKeys.has(`${row},${col}`);
 
   // Background
   _ctx.fillStyle = isSelectedPanel ? 'rgba(96,165,250,0.18)'
@@ -243,6 +269,24 @@ function drawPanel(row, col, state) {
     : 'rgba(255,255,255,0.05)';
   roundRect(x, y, w, h, 4);
   _ctx.fill();
+
+  // Stronger tint on the exact sub-sections that use the highlighted point.
+  if (isSelectedPanel) {
+    const nSubs = diodeSubsections || 2;
+    _ctx.save();
+    _ctx.fillStyle = 'rgba(96,165,250,0.22)';
+    for (let s = 0; s < nSubs; s++) {
+      if (!coverage.subKeys.has(`${row},${col},${s}`)) continue;
+      let sx, sy, sw, sh;
+      if (diodeSplit === 'vertical') {
+        sx = x + (s / nSubs) * w; sy = y; sw = w / nSubs; sh = h;
+      } else {
+        sx = x; sy = y + (s / nSubs) * h; sw = w; sh = h / nSubs;
+      }
+      _ctx.fillRect(sx, sy, sw, sh);
+    }
+    _ctx.restore();
+  }
 
   // Border
   _ctx.strokeStyle = isSelectedPanel ? 'rgba(96,165,250,0.7)'
@@ -342,9 +386,17 @@ function drawSnapTargets(row, col) {
   _ctx.save();
   for (const t of targets) {
     _ctx.beginPath();
-    _ctx.arc(t.cx, t.cy, 2.5, 0, Math.PI * 2);
-    _ctx.fillStyle = 'rgba(245,166,35,0.35)';
-    _ctx.fill();
+    if (t.junction) {
+      // Panel intersections: small hollow ring, slightly stronger.
+      _ctx.arc(t.cx, t.cy, 3.5, 0, Math.PI * 2);
+      _ctx.strokeStyle = 'rgba(245,166,35,0.7)';
+      _ctx.lineWidth = 1.2;
+      _ctx.stroke();
+    } else {
+      _ctx.arc(t.cx, t.cy, 2.5, 0, Math.PI * 2);
+      _ctx.fillStyle = 'rgba(245,166,35,0.35)';
+      _ctx.fill();
+    }
   }
   _ctx.restore();
 }
@@ -411,12 +463,21 @@ function getSnapTargets(row, col) {
   const targets = [
     // Center
     { lx: 0.5, ly: 0.5 },
-    // Corners
+    // Corners (inset, "near corner inside the panel")
     { lx: M, ly: M }, { lx: 1 - M, ly: M },
     { lx: M, ly: 1 - M }, { lx: 1 - M, ly: 1 - M },
     // Edge midpoints
     { lx: 0.5, ly: M }, { lx: 0.5, ly: 1 - M },
     { lx: M, ly: 0.5 }, { lx: 1 - M, ly: 0.5 },
+    // Panel intersections — the true grid vertices where adjacent panels meet.
+    // Stored at the cell's exact corners (lx/ly ∈ {0,1}); in array-global
+    // coordinates these land on the shared boundary, so a point placed here is
+    // assigned to all sub-panels meeting at that junction.
+    { lx: 0, ly: 0, junction: true }, { lx: 1, ly: 0, junction: true },
+    { lx: 0, ly: 1, junction: true }, { lx: 1, ly: 1, junction: true },
+    // Edge intersections (midpoints of the true panel edges)
+    { lx: 0.5, ly: 0, junction: true }, { lx: 0.5, ly: 1, junction: true },
+    { lx: 0, ly: 0.5, junction: true }, { lx: 1, ly: 0.5, junction: true },
   ];
   // Diode split midpoints
   for (let s = 1; s < nSubs; s++) {
@@ -427,12 +488,16 @@ function getSnapTargets(row, col) {
       targets.push({ lx: 0.5, ly: f });
     }
   }
-  // Convert to canvas coords
-  return targets.map(t => ({
-    lx: t.lx, ly: t.ly,
-    cx: r.x + t.lx * r.w,
-    cy: r.y + t.ly * r.h,
-  }));
+  // Convert to canvas coords (junctions shifted to the gutter centre)
+  return targets.map(t => {
+    const { sx, sy } = gutterShift(t.lx, t.ly);
+    return {
+      lx: t.lx, ly: t.ly,
+      junction: !!t.junction,
+      cx: r.x + t.lx * r.w + sx,
+      cy: r.y + t.ly * r.h + sy,
+    };
+  });
 }
 
 function snapLocal(mx, my, row, col) {
@@ -595,8 +660,15 @@ function updatePointPanel() {
     return;
   }
 
-  const panelLabel = `${String.fromCharCode(65 + pt.panelRow)}${pt.panelCol + 1}`;
   const photo = pt.photoId ? state.photos[pt.photoId] : null;
+
+  // Panels/sub-panels that actually use this point's mask (not just an "owner").
+  const cov = getCoverageForPoints([pt.id]);
+  const usedLabels = [...cov.panelKeys]
+    .map(k => k.split(',').map(Number))
+    .sort((a, b) => a[0] - b[0] || a[1] - b[1])
+    .map(([r, c]) => `${String.fromCharCode(65 + r)}${c + 1}`);
+  const usedText = usedLabels.length ? usedLabels.join(', ') : '\u2014';
 
   qs('#point-panel-title', _container).textContent = pt.name;
 
@@ -608,13 +680,13 @@ function updatePointPanel() {
           <input type="text" id="inp-pt-name" value="${esc(pt.name)}" style="font-size:14px;font-weight:600">
         </div>
         <div class="form-group">
-          <label>Panel</label>
-          <div style="font-family:'JetBrains Mono',monospace;font-size:14px;padding:6px 0">${panelLabel}</div>
+          <label>Used by panels</label>
+          <div id="point-used" style="font-family:'JetBrains Mono',monospace;font-size:13px;padding:6px 0" title="Every panel/sub-panel whose shading uses this point's photo mask">${usedText}</div>
         </div>
         <div class="form-group">
           <label>Position</label>
-          <div id="point-coords" style="font-family:'JetBrains Mono',monospace;font-size:12px;padding:6px 0;color:var(--text2)">
-            x: ${(pt.localX * state.system.panelWidth).toFixed(3)}m, y: ${(pt.localY * state.system.panelHeight).toFixed(3)}m
+          <div id="point-coords" style="font-family:'JetBrains Mono',monospace;font-size:12px;padding:6px 0;color:var(--text2)" title="Physical position from the array's top-left corner, including the inter-panel gutter">
+            ${(() => { const m = pointMeters(pt); return `x: ${m.x.toFixed(3)}m, y: ${m.y.toFixed(3)}m`; })()}
           </div>
         </div>
       </div>
@@ -637,7 +709,7 @@ function updatePointPanel() {
       document.querySelector('[data-view="editor"]').click();
     });
     qs('#btn-pt-delete-photo', area)?.addEventListener('click', () => {
-      if (!confirm('Delete this photo? Trace data will be lost.')) return;
+      if (!confirm('Delete this photo? Any painted mask(s) will be kept for this point and re-applied to the next photo you add here.')) return;
       removePhoto(photo.id);
       updatePointPanel();
       drawArray();
@@ -719,7 +791,19 @@ function updatePointCoords() {
   if (!coordEl || !_selectedPtId) return;
   const state = getState();
   const pt = state.points[_selectedPtId];
-  if (pt) coordEl.textContent = `x: ${(pt.localX * state.system.panelWidth).toFixed(3)}m, y: ${(pt.localY * state.system.panelHeight).toFixed(3)}m`;
+  if (pt) {
+    const m = pointMeters(pt);
+    coordEl.textContent = `x: ${m.x.toFixed(3)}m, y: ${m.y.toFixed(3)}m`;
+  }
+
+  const usedEl = qs('#point-used', _container);
+  if (usedEl && pt) {
+    const labels = [...getCoverageForPoints([pt.id]).panelKeys]
+      .map(k => k.split(',').map(Number))
+      .sort((a, b) => a[0] - b[0] || a[1] - b[1])
+      .map(([r, c]) => `${String.fromCharCode(65 + r)}${c + 1}`);
+    usedEl.textContent = labels.length ? labels.join(', ') : '\u2014';
+  }
 }
 
 // ─── File Handling ────────────────────────────────────
@@ -735,6 +819,42 @@ async function handleFilesForPoint(files) {
   }
   updatePointPanel();
   drawArray();
+}
+
+/**
+ * Re-apply a mask that was retained on a point (when its previous photo was
+ * deleted) onto a freshly-assigned photo, re-projecting through sky space so it
+ * works even when the new photo uses a different projection.
+ */
+async function applyRetainedMask(pointId, photoId) {
+  const state = getState();
+  const pt = state.points[pointId];
+  const photo = state.photos[photoId];
+  if (!pt?.retainedMask || !photo) return;
+  const retained = pt.retainedMask;
+  const sys = state.system;
+  for (const [name, t] of Object.entries(retained.traces || {})) {
+    try {
+      const newMask = await reprojectMaskToPhoto(retained, t.groundMask, photo, sys);
+      if (!newMask) continue;
+      let trace = photo.traces[name];
+      if (!trace) {
+        trace = photo.traces[name] = {
+          name,
+          isDefault: false,
+          color: t.color || '#3b82f6',
+          paths: [],
+          horizonProfile: null,
+          groundMask: null,
+        };
+      }
+      trace.groundMask = newMask;
+      trace.horizonProfile = null;
+    } catch (e) {
+      console.warn('[SolarScope] retained mask re-projection failed:', e);
+    }
+  }
+  delete pt.retainedMask;
 }
 
 async function processFile(file, assignToSelected) {
@@ -756,6 +876,7 @@ async function processFile(file, assignToSelected) {
 
     if (assignToSelected && _selectedPtId) {
       assignPhotoToPoints(photoId, [_selectedPtId]);
+      await applyRetainedMask(_selectedPtId, photoId);
     }
   } catch (err) {
     console.error('Error processing photo:', err);
@@ -823,6 +944,7 @@ async function processInspFile(file, assignToSelected) {
 
     if (assignToSelected && _selectedPtId) {
       assignPhotoToPoints(photoId, [_selectedPtId]);
+      await applyRetainedMask(_selectedPtId, photoId);
     }
 
     drawArray();

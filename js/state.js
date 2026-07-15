@@ -26,6 +26,16 @@ function defaultProject() {
       source: 'manual', // 'manual' | 'photo-exif'
     },
 
+    /**
+     * User-supplied weather time series (e.g. NSRDB / SAM TMY CSV).
+     * null until a file is uploaded on the Setup page. Shape:
+     * { filename, format, meta:{lat,lon,tz,elevation,city,state,source},
+     *   columns:[...], records:[{month,day,hour,minute,dni,dhi,ghi,temp,wind,...}],
+     *   count }
+     * The heavy `records` array is dropped from lightweight serialization.
+     */
+    weather: null,
+
     system: {
       rows: 2,
       cols: 10,
@@ -40,6 +50,17 @@ function defaultProject() {
       inverterEff: 96,       // percent
       diodeSplit: 'horizontal', // 'horizontal' | 'vertical'
       diodeSubsections: 2,      // visual sub-sections per panel
+      cameraFovCalibration: 104, // fisheye half-angle (°) from star calibration; null = use INSP nominal
+      // Monthly BARE-branch BEAM transmittance (Jan..Dec) for deciduous-class masks.
+      // Default = temperate maple, ~43°N (Konarska bare midpoint ~0.45; leaf-on ~0.04).
+      // Leaf-out in May, full leaf Jun–Sep, leaf-drop October.
+      deciduousBeamTau: [0.45, 0.45, 0.45, 0.42, 0.25, 0.05, 0.04, 0.04, 0.07, 0.22, 0.42, 0.45],
+      // Diffuse transmittance offset: diffuse τ(month) = beam τ(month) + offset (clamped).
+      // Bare branches scatter/admit more sky-diffuse than collimated beam.
+      deciduousDiffuseOffset: 0.15,
+      // Physical gap between adjacent panels (meters). ~0.025 m ≈ 1 inch. Drawn as
+      // a real gutter in the array map; intersection snaps sit in the gutter centre.
+      panelGap: 0.025,
     },
 
     /**
@@ -64,10 +85,51 @@ function defaultProject() {
   };
 }
 
+/**
+ * Normalize trace horizon profiles from saved JSON.
+ * Older saves may store Float32Array as plain objects with numeric keys.
+ */
+function normalizeLoadedProfiles(project) {
+  const photos = project?.photos;
+  if (!photos || typeof photos !== 'object') return;
+
+  for (const photo of Object.values(photos)) {
+    if (!photo?.traces || typeof photo.traces !== 'object') continue;
+    for (const trace of Object.values(photo.traces)) {
+      if (!trace) continue;
+      const hp = trace.horizonProfile;
+      if (!hp) continue;
+
+      if (ArrayBuffer.isView(hp)) {
+        // Already typed array-like; keep as-is.
+        continue;
+      }
+
+      if (Array.isArray(hp)) {
+        const arr = new Float32Array(360);
+        for (let i = 0; i < 360; i++) {
+          arr[i] = Number(hp[i] ?? 0) || 0;
+        }
+        trace.horizonProfile = arr;
+        continue;
+      }
+
+      if (typeof hp === 'object') {
+        const arr = new Float32Array(360);
+        for (let i = 0; i < 360; i++) {
+          arr[i] = Number(hp[i] ?? hp[String(i)] ?? 0) || 0;
+        }
+        trace.horizonProfile = arr;
+      }
+    }
+  }
+}
+
 /** Initialize the state store */
 export function initState(saved = null) {
   if (saved) {
     _state = { ...defaultProject(), ...saved, _results: null };
+    normalizeLoadedProfiles(_state);
   } else {
     _state = defaultProject();
   }
@@ -191,6 +253,40 @@ export function addPhoto(photoData) {
 
 /** Remove a photo and unlink from points */
 export function removePhoto(photoId) {
+  const photo = _state.photos[photoId];
+  // Preserve any painted masks at the point level so they survive a
+  // delete-and-replace of the photo for the same point. The snapshot keeps
+  // enough projection info to re-rasterise the mask onto a new photo (even a
+  // different projection) when one is assigned to the point.
+  if (photo) {
+    const maskTraces = {};
+    for (const [name, t] of Object.entries(photo.traces || {})) {
+      if (t.groundMask) {
+        maskTraces[name] = {
+          name,
+          color: t.color,
+          isDefault: !!t.isDefault,
+          groundMask: t.groundMask,
+        };
+      }
+    }
+    if (Object.keys(maskTraces).length) {
+      const retained = {
+        projection: photo.projection,
+        metadata: {
+          compassHeading: photo.metadata?.compassHeading ?? null,
+          pitch: photo.metadata?.pitch ?? 0,
+        },
+        fisheye: photo.fisheye || null,
+        orientation: photo.orientation || null,
+        filename: photo.filename,
+        traces: maskTraces,
+      };
+      for (const pt of Object.values(_state.points)) {
+        if (pt.photoId === photoId) pt.retainedMask = retained;
+      }
+    }
+  }
   delete _state.photos[photoId];
   for (const pt of Object.values(_state.points)) {
     if (pt.photoId === photoId) pt.photoId = null;
@@ -320,10 +416,26 @@ export function assignPhotoToAll(photoId) {
 
 // --- Serialization ---
 
+/** Set (or replace) the uploaded weather time series. Pass null to clear. */
+export function setWeather(weather) {
+  _state.weather = weather || null;
+  emit('weather');
+  emit('*');
+}
+
+/** Remove any uploaded weather time series. */
+export function clearWeather() {
+  setWeather(null);
+}
+
 /** Serialize state for save (strips computed data and large blobs optionally) */
 export function serialize(includeImages = true) {
   const s = { ..._state };
   delete s._results;
+  // The 8760-row weather record array is heavy; persist metadata only.
+  if (s.weather && s.weather.records) {
+    s.weather = { ...s.weather, records: null, recordsDropped: true };
+  }
   if (!includeImages) {
     // Strip dataUrl from photos for lightweight save
     const photos = {};
@@ -343,6 +455,29 @@ export function deserialize(data) {
 // --- Sub-panel mapping (for solar analysis) ---
 
 /**
+ * Array-global PHYSICAL position of a measurement point, in metres.
+ *
+ * The array is modelled as real hardware: each panel occupies panelWidth ×
+ * panelHeight, and successive panels are separated by a real inter-panel
+ * gutter (system.panelGap). Edge / junction positions (localX or localY of
+ * exactly 0 or 1) are pushed to the centre-line of that gutter, so an
+ * intersection snap genuinely lives in the gap between panels rather than on
+ * one panel's edge.
+ *
+ * @param {{panelCol:number,panelRow:number,localX:number,localY:number}} pt
+ * @returns {{x:number,y:number}} metres from the array's top-left origin
+ */
+export function pointMeters(pt) {
+  const { panelWidth: W, panelHeight: H, panelGap: g = 0 } = _state.system;
+  const sx = pt.localX === 1 ? g / 2 : pt.localX === 0 ? -g / 2 : 0;
+  const sy = pt.localY === 1 ? g / 2 : pt.localY === 0 ? -g / 2 : 0;
+  return {
+    x: pt.panelCol * (W + g) + pt.localX * W + sx,
+    y: pt.panelRow * (H + g) + pt.localY * H + sy,
+  };
+}
+
+/**
  * Returns array of sub-panel objects based on diode sub-sections.
  * Each sub-panel maps to ALL measurement points within its region.
  * If none fall inside, falls back to nearest point.
@@ -351,6 +486,7 @@ export function deserialize(data) {
  */
 export function getSubPanels() {
   const { rows, cols, diodeSplit, diodeSubsections } = _state.system;
+  const { panelWidth: W, panelHeight: H, panelGap: g = 0 } = _state.system;
   const nSubs = diodeSubsections || 2;
   const subs = [];
   const points = Object.values(_state.points);
@@ -371,8 +507,15 @@ export function getSubPanels() {
           y0 = r + s / nSubs;
           y1 = r + (s + 1) / nSubs;
         }
-        const subCX = (x0 + x1) / 2;
-        const subCY = (y0 + y1) / 2;
+
+        // Physical (metric) centre of this sub-panel, including the gutter
+        // offset of preceding panels — used for true-distance nearest fallback.
+        const mSubCX = c * (W + g) + (diodeSplit === 'vertical'
+          ? (s + 0.5) / nSubs * W
+          : W / 2);
+        const mSubCY = r * (H + g) + (diodeSplit === 'vertical'
+          ? H / 2
+          : (s + 0.5) / nSubs * H);
 
         // Find all points inside this sub-panel region
         const inside = [];
@@ -383,14 +526,17 @@ export function getSubPanels() {
           const px = pt.panelCol + pt.localX;
           const py = pt.panelRow + pt.localY;
 
-          // Check if point falls within sub-panel bounds
+          // Containment is in panel-relative units (gutter-invariant): a point
+          // on a shared edge / grid junction belongs to every adjacent panel.
           if (px >= x0 && px <= x1 && py >= y0 && py <= y1) {
             inside.push(pt.id);
           }
 
-          // Also track nearest for fallback
-          const dx = px - subCX;
-          const dy = py - subCY;
+          // Nearest-point fallback uses TRUE physical distance (metres), so a
+          // point on the far side of an inter-panel gutter is correctly farther.
+          const m = pointMeters(pt);
+          const dx = m.x - mSubCX;
+          const dy = m.y - mSubCY;
           const d = dx * dx + dy * dy;
           if (d < nearestDist) {
             nearestDist = d;
@@ -410,11 +556,41 @@ export function getSubPanels() {
             ? (s === 0 ? 'top' : 'bottom')
             : `${s + 1}/${nSubs}`,
           ptIds,
+          // Strictly-contained points (empty when only the nearest fallback applies)
+          // and the sub-panel's physical centre in metres — used by distance-weighted
+          // shade interpolation.
+          insideIds: inside.slice(),
+          mX: mSubCX,
+          mY: mSubCY,
         });
       }
     }
   }
   return subs;
+}
+
+/**
+ * Returns the panels and sub-panels that actually USE a given set of points.
+ * A panel/sub-panel "uses" a point when that point falls inside its region
+ * (or is its nearest fallback) — see getSubPanels(). A point on a shared edge
+ * or grid junction is therefore used by every adjacent panel.
+ *
+ * @param {string[]} ptIds - point IDs to look up
+ * @returns {{panelKeys:Set<string>, subKeys:Set<string>}} keys are "row,col"
+ *   and "row,col,sub" respectively.
+ */
+export function getCoverageForPoints(ptIds) {
+  const set = new Set(ptIds);
+  const panelKeys = new Set();
+  const subKeys = new Set();
+  if (set.size === 0) return { panelKeys, subKeys };
+  for (const sp of getSubPanels()) {
+    if (sp.ptIds.some(id => set.has(id))) {
+      panelKeys.add(`${sp.row},${sp.col}`);
+      subKeys.add(`${sp.row},${sp.col},${sp.sub}`);
+    }
+  }
+  return { panelKeys, subKeys };
 }
 
 /** Backwards-compatible alias (returns 2-sub panels with ptIds arrays) */

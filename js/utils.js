@@ -991,7 +991,12 @@ export function sunPositionAtTime(datetime, lat, lon) {
 
   // Solar noon in UTC for this longitude
   const solarNoonUTC = 12 - lon / 15 - eot / 60;
-  const hourAngle = (hours - solarNoonUTC) * 15; // degrees
+  // Wrap into [-180, 180) so the hour angle stays continuous across the UTC-day
+  // boundary. getUTCHours() resets 23→0 at UTC midnight, which for western-
+  // hemisphere longitudes happens mid-evening; without this wrap the afternoon
+  // (hourAngle > 0) azimuth test flips and the azimuth mirrors east↔west.
+  let hourAngle = (hours - solarNoonUTC) * 15; // degrees
+  hourAngle = ((hourAngle + 180) % 360 + 360) % 360 - 180;
 
   const DEG = Math.PI / 180;
   const lr = lat * DEG, dr = decl * DEG, hr = hourAngle * DEG;
@@ -1001,9 +1006,14 @@ export function sunPositionAtTime(datetime, lat, lon) {
   const cosEl = Math.cos(el * DEG);
   if (cosEl < 1e-10) return { azimuth: 180, elevation: el };
 
-  const cosAz = (Math.sin(dr) - Math.sin(lr) * sinEl) / (Math.cos(lr) * cosEl);
-  let az = Math.acos(Math.max(-1, Math.min(1, cosAz))) / DEG;
-  if (hourAngle > 0) az = 360 - az;
+  // Azimuth from North via atan2 — continuous in all quadrants (no acos + sign
+  // branch, which could mirror east↔west when the hour angle range shifted).
+  const cosLat = Math.cos(lr);
+  const s = -Math.cos(dr) * Math.sin(hr);
+  const c = Math.abs(cosLat) > 1e-9
+    ? (Math.sin(dr) - Math.sin(lr) * sinEl) / cosLat
+    : -Math.cos(hr); // degenerate at the poles
+  const az = ((Math.atan2(s, c) / DEG) % 360 + 360) % 360;
 
   return { azimuth: az, elevation: el };
 }
@@ -1109,6 +1119,28 @@ export function normalizeFisheyeFov(fov) {
 }
 
 /**
+ * Resolve the effective fisheye FOV half-angle (degrees) for a photo.
+ *
+ * Priority:
+ *   1. Per-photo manual override (orientation.fov) — set via the editor slider.
+ *   2. Project camera calibration (system.cameraFovCalibration) — e.g. the value
+ *      from an empirical star calibration, which is more trustworthy than the
+ *      nominal per-lens FOV the camera writes into the INSP trailer.
+ *   3. The normalized INSP trailer value (nominal, often ~90° for Insta360).
+ *
+ * @param {object} photo - photo object (uses .orientation, .fisheye)
+ * @param {object} system - state.system (uses .cameraFovCalibration)
+ * @returns {number} half-angle FOV in degrees
+ */
+export function resolveFisheyeFov(photo, system) {
+  const manual = photo?.orientation?.fov;
+  if (manual != null) return manual;
+  const cal = system?.cameraFovCalibration;
+  if (cal != null && cal > 0) return cal;
+  return normalizeFisheyeFov(photo?.fisheye?.fov);
+}
+
+/**
  * Build a shade lookup function from a photo and its decoded mask pixel data.
  * Returns (az, el) => boolean — true means the sun at (az, el) is shaded (ground).
  *
@@ -1118,7 +1150,35 @@ export function normalizeFisheyeFov(fov) {
  * @returns {function(number, number): boolean}
  */
 export function buildSkyMaskLookup(photo, maskData, systemDefaults = {}) {
-  if (!maskData || !maskData.data) return () => false;
+  const cat = buildSkyMaskCategoryLookup(photo, maskData, systemDefaults);
+  return (az, el) => cat(az, el) !== 0;
+}
+
+/**
+ * Mask obstruction categories.
+ *  0 = open sky
+ *  1 = solid/opaque obstruction (red paint, or structure behind the panel)
+ *  2 = deciduous canopy (green paint) — seasonally varying transmittance
+ */
+export const MASK_OPEN = 0;
+export const MASK_SOLID = 1;
+export const MASK_DECIDUOUS = 2;
+
+// Classify a single mask pixel by colour: green-dominant = deciduous, otherwise
+// (red/grey) = solid. Transparent (alpha ≤ 128) = open sky.
+function pixelCategory(data, ix, iy, width) {
+  const idx = (iy * width + ix) * 4;
+  if (data[idx + 3] <= 128) return MASK_OPEN;
+  return data[idx + 1] > data[idx] ? MASK_DECIDUOUS : MASK_SOLID;
+}
+
+/**
+ * Category-aware version of buildSkyMaskLookup.
+ * Returns (az, el) => 0 | 1 | 2  (open | solid | deciduous).
+ * buildSkyMaskLookup() is a thin boolean wrapper over this.
+ */
+export function buildSkyMaskCategoryLookup(photo, maskData, systemDefaults = {}) {
+  if (!maskData || !maskData.data) return () => MASK_OPEN;
   const { data, width, height } = maskData;
 
   if (photo.projection === 'fisheye' && photo.fisheye) {
@@ -1127,25 +1187,24 @@ export function buildSkyMaskLookup(photo, maskData, systemDefaults = {}) {
     const panelTilt = ori.panelTilt ?? systemDefaults.tilt ?? 30;
     const clockAngle = ori.clockAngle ?? photo.fisheye.accelClockAngle ?? 0;
     const worldToCamera = buildFisheyeRotation(panelAz, panelTilt, clockAngle);
-    const fov = ori.fov ?? normalizeFisheyeFov(photo.fisheye.fov);
+    const fov = resolveFisheyeFov(photo, systemDefaults);
     const imgSize = Math.min(width, height);
     const D = Math.PI / 180;
 
     return (az, el) => {
       const fp = skyToFisheye(az, el, worldToCamera, imgSize, fov);
       if (!fp.visible) {
-        // Direction is outside camera FOV.
-        // If it's behind the panel plane (below panel surface), it's physically
-        // blocked by the panel/roof structure → treat as shaded.
+        // Outside camera FOV. Behind the panel plane → solid (panel/roof); above
+        // the panel but outside FOV → treat as open sky.
         const cosEl = Math.cos(el * D), sinEl = Math.sin(el * D);
         const wx = cosEl * Math.sin(az * D);
         const wy = cosEl * Math.cos(az * D);
         const wz = sinEl;
-        return worldToCamera(wx, wy, wz).cz <= 0;
+        return worldToCamera(wx, wy, wz).cz <= 0 ? MASK_SOLID : MASK_OPEN;
       }
       const ix = Math.max(0, Math.min(width - 1, Math.round(fp.x)));
       const iy = Math.max(0, Math.min(height - 1, Math.round(fp.y)));
-      return data[(iy * width + ix) * 4 + 3] > 128;
+      return pixelCategory(data, ix, iy, width);
     };
   } else {
     // Equirectangular — mask canvas represents upper hemisphere only
@@ -1158,8 +1217,8 @@ export function buildSkyMaskLookup(photo, maskData, systemDefaults = {}) {
       const ix = Math.round(norm.x * (width - 1));
       // Map yNorm (0..0.5 for upper hemisphere) to full canvas height
       const iy = Math.round((norm.y / 0.5) * (height - 1));
-      if (ix < 0 || ix >= width || iy < 0 || iy >= height) return false;
-      return data[(iy * width + ix) * 4 + 3] > 128;
+      if (ix < 0 || ix >= width || iy < 0 || iy >= height) return MASK_OPEN;
+      return pixelCategory(data, ix, iy, width);
     };
   }
 }
@@ -1180,6 +1239,68 @@ export function buildMergedMaskLookup(lookups) {
     }
     return false;
   };
+}
+
+/**
+ * Re-project a ground mask painted on one photo onto another photo of the same
+ * point, going through (az, el) sky space so it works across projections
+ * (e.g. a fisheye mask re-rasterised onto an equirectangular photo).
+ *
+ * @param {object} srcPhoto - source photo-like object (.projection, .metadata, .fisheye, .orientation)
+ * @param {string} srcMaskDataUrl - source trace.groundMask PNG data URL
+ * @param {object} targetPhoto - destination photo object (.projection, .metadata, .fisheye, .orientation)
+ * @param {object} sys - state.system (azimuth/tilt/cameraFovCalibration fallbacks)
+ * @returns {Promise<string|null>} PNG data URL of the re-projected mask, or null if empty
+ */
+export async function reprojectMaskToPhoto(srcPhoto, srcMaskDataUrl, targetPhoto, sys = {}) {
+  if (!srcMaskDataUrl) return null;
+  const srcMaskData = await decodeMaskDataUrl(srcMaskDataUrl);
+  const srcCat = buildSkyMaskCategoryLookup(srcPhoto, srcMaskData, {
+    azimuth: sys.azimuth, tilt: sys.tilt, cameraFovCalibration: sys.cameraFovCalibration,
+  });
+
+  // Target rasterisation grid + pixel→sky mapping (mirrors the editor canvases).
+  let outW, outH, pixelToSky;
+  if (targetPhoto.projection === 'fisheye' && targetPhoto.fisheye) {
+    outW = 800; outH = 800;
+    const ori = targetPhoto.orientation || {};
+    const worldToCamera = buildFisheyeRotation(
+      ori.panelAzimuth ?? sys.azimuth ?? 180,
+      ori.panelTilt ?? sys.tilt ?? 30,
+      ori.clockAngle ?? targetPhoto.fisheye.accelClockAngle ?? 0,
+    );
+    const fov = resolveFisheyeFov(targetPhoto, sys);
+    const imgSize = Math.min(outW, outH);
+    pixelToSky = (px, py) => fisheyeToSky(px, py, worldToCamera, imgSize, fov);
+  } else {
+    // Equirectangular — upper hemisphere only (yNorm 0..0.5 → elevation 90..0).
+    outW = 1200; outH = 600;
+    const heading = targetPhoto.metadata?.compassHeading ?? 180;
+    const pitch = targetPhoto.metadata?.pitch ?? 0;
+    pixelToSky = (px, py) => imageToSky(px / outW, (py / outH) * 0.5, heading, pitch);
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = outW; canvas.height = outH;
+  const ctx = canvas.getContext('2d');
+  const out = ctx.createImageData(outW, outH);
+  const d = out.data;
+  let painted = 0;
+  for (let py = 0; py < outH; py++) {
+    for (let px = 0; px < outW; px++) {
+      const sky = pixelToSky(px + 0.5, py + 0.5);
+      if (!sky || sky.valid === false || !(sky.elevation >= 0)) continue;
+      const cat = srcCat(sky.azimuth, sky.elevation);
+      if (cat === MASK_OPEN) continue;
+      const i = (py * outW + px) * 4;
+      if (cat === MASK_DECIDUOUS) { d[i] = 60; d[i + 1] = 180; d[i + 2] = 60; d[i + 3] = 217; }
+      else { d[i] = 230; d[i + 1] = 60; d[i + 2] = 60; d[i + 3] = 217; }
+      painted++;
+    }
+  }
+  if (!painted) return null;
+  ctx.putImageData(out, 0, 0);
+  return canvas.toDataURL('image/png');
 }
 
 /**
@@ -1362,6 +1483,130 @@ export function fmtLatLon(lat, lon) {
   const latDir = lat >= 0 ? 'N' : 'S';
   const lonDir = lon >= 0 ? 'E' : 'W';
   return `${Math.abs(lat).toFixed(4)}°${latDir}, ${Math.abs(lon).toFixed(4)}°${lonDir}`;
+}
+
+// ============================================================
+// Weather CSV parsing (NSRDB / SAM TMY format)
+// ============================================================
+
+/** Split one CSV line, trimming a trailing \r. Simple comma split (TMY files are unquoted). */
+function _csvSplit(line) {
+  return line.replace(/\r$/, '').split(',');
+}
+
+/** Find the index of the first matching header (case-insensitive, exact-ish). */
+function _findCol(headers, candidates) {
+  const lower = headers.map(h => h.trim().toLowerCase());
+  for (const cand of candidates) {
+    const i = lower.indexOf(cand.toLowerCase());
+    if (i !== -1) return i;
+  }
+  return -1;
+}
+
+/**
+ * Parse an NSRDB / SAM-style TMY weather CSV.
+ *
+ * Expected layout (the common NSRDB download format):
+ *   line 1: meta keys   (Source,Location ID,City,...,Latitude,Longitude,Time Zone,Elevation,...)
+ *   line 2: meta values
+ *   line 3: data column headers (Year,Month,Day,Hour,Minute,DNI,DHI,GHI,Temperature,...)
+ *   line 4+: hourly data
+ *
+ * Also tolerates a "headers-only" CSV where the first row is already the data
+ * column header row (no two-line metadata block).
+ *
+ * @param {string} text raw file contents
+ * @returns {{filename:string|null, format:string, meta:object, columns:string[], records:object[], count:number}}
+ * @throws {Error} if the file does not contain recognizable irradiance columns
+ */
+export function parseWeatherCsv(text, filename = null) {
+  if (!text || typeof text !== 'string') throw new Error('Empty weather file.');
+  const lines = text.split('\n').filter(l => l.trim().length > 0);
+  if (lines.length < 2) throw new Error('Weather file has too few rows.');
+
+  let meta = {};
+  let headerRowIdx = 0;
+
+  // Detect the two-line metadata block by checking if line 1 looks like meta keys
+  const firstCols = _csvSplit(lines[0]).map(s => s.trim().toLowerCase());
+  const looksLikeMeta = firstCols.includes('latitude') || firstCols.includes('source') || firstCols.includes('location id');
+  if (looksLikeMeta && lines.length >= 3) {
+    const keys = _csvSplit(lines[0]);
+    const vals = _csvSplit(lines[1]);
+    keys.forEach((k, i) => { meta[k.trim()] = (vals[i] ?? '').trim(); });
+    headerRowIdx = 2;
+  }
+
+  const headers = _csvSplit(lines[headerRowIdx]).map(h => h.trim());
+  const col = {
+    year: _findCol(headers, ['Year']),
+    month: _findCol(headers, ['Month']),
+    day: _findCol(headers, ['Day']),
+    hour: _findCol(headers, ['Hour']),
+    minute: _findCol(headers, ['Minute']),
+    dni: _findCol(headers, ['DNI', 'Beam', 'Direct Normal Irradiance']),
+    dhi: _findCol(headers, ['DHI', 'Diffuse', 'Diffuse Horizontal Irradiance']),
+    ghi: _findCol(headers, ['GHI', 'Global', 'Global Horizontal Irradiance']),
+    temp: _findCol(headers, ['Temperature', 'Temp', 'Dry Bulb Temperature', 'Tdry']),
+    wind: _findCol(headers, ['Wind Speed', 'Wspd']),
+    pressure: _findCol(headers, ['Pressure']),
+    albedo: _findCol(headers, ['Surface Albedo', 'Albedo']),
+  };
+
+  if (col.dni === -1 && col.ghi === -1) {
+    throw new Error('No DNI/GHI columns found — is this an NSRDB / SAM TMY CSV?');
+  }
+
+  const num = (cols, idx) => {
+    if (idx === -1) return null;
+    const v = parseFloat(cols[idx]);
+    return isNaN(v) ? null : v;
+  };
+
+  const records = [];
+  for (let i = headerRowIdx + 1; i < lines.length; i++) {
+    const cols = _csvSplit(lines[i]);
+    if (cols.length < headers.length - 2) continue; // skip malformed/short rows
+    records.push({
+      year: num(cols, col.year),
+      month: num(cols, col.month),
+      day: num(cols, col.day),
+      hour: num(cols, col.hour),
+      minute: num(cols, col.minute),
+      dni: num(cols, col.dni),
+      dhi: num(cols, col.dhi),
+      ghi: num(cols, col.ghi),
+      temp: num(cols, col.temp),
+      wind: num(cols, col.wind),
+      pressure: num(cols, col.pressure),
+      albedo: num(cols, col.albedo),
+    });
+  }
+
+  if (records.length === 0) throw new Error('No data rows parsed from weather file.');
+
+  const numMeta = (k) => {
+    const v = parseFloat(meta[k]);
+    return isNaN(v) ? null : v;
+  };
+
+  return {
+    filename: filename || null,
+    format: meta.Source ? `${meta.Source} TMY` : 'TMY CSV',
+    meta: {
+      source: meta.Source ?? null,
+      city: meta.City && meta.City !== '-' ? meta.City : null,
+      state: meta.State && meta.State !== '-' ? meta.State : null,
+      lat: numMeta('Latitude'),
+      lon: numMeta('Longitude'),
+      tz: numMeta('Time Zone'),
+      elevation: numMeta('Elevation'),
+    },
+    columns: headers,
+    records,
+    count: records.length,
+  };
 }
 
 // ============================================================

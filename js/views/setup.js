@@ -4,8 +4,8 @@
  * Includes live array layout visualizer with diode split preview.
  */
 
-import { getState, setState, batchUpdate, rebuildPoints, subscribe } from '../state.js';
-import { el, qs, clearEl, fmtLatLon, debounce } from '../utils.js';
+import { getState, setState, batchUpdate, rebuildPoints, subscribe, setWeather, clearWeather } from '../state.js';
+import { el, qs, clearEl, fmtLatLon, debounce, parseWeatherCsv } from '../utils.js';
 
 let _container = null;
 let _vizCanvas = null;
@@ -67,6 +67,19 @@ export function render(container) {
         <div style="margin-top:12px;display:flex;gap:8px;align-items:center">
           <button class="btn btn-sm" id="btn-geolocate">&#9737; Use My Location</button>
           <span class="hint" id="geo-status"></span>
+        </div>
+        <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
+          <label style="display:block;font-weight:600;margin-bottom:4px">Weather Data (TMY)</label>
+          <span class="hint" style="display:block;margin-bottom:8px">
+            Upload an NSRDB / SAM hourly TMY CSV (DNI, DHI, GHI, temperature, wind).
+            Used as the irradiance source for production modeling.
+          </span>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <input type="file" id="inp-weather-file" accept=".csv,text/csv" style="display:none">
+            <button class="btn btn-sm" id="btn-weather-upload">&#8593; Upload Weather CSV</button>
+            <button class="btn btn-sm" id="btn-weather-clear" style="display:none">Remove</button>
+            <span class="hint" id="weather-status"></span>
+          </div>
         </div>
         <p class="hint" style="margin-top:10px">
           Location can also be auto-detected from Insta360 photo GPS metadata.
@@ -157,6 +170,34 @@ export function render(container) {
                 <input type="number" id="inp-diode-subs" value="${state.system.diodeSubsections}" min="1" max="6" step="1">
                 <span class="hint">Usually 2 or 3</span>
               </div>
+              <div class="form-group">
+                <label>Panel Gap (m)</label>
+                <input type="number" id="inp-panel-gap" value="${state.system.panelGap ?? 0.025}" min="0" max="0.5" step="0.005">
+                <span class="hint">Gap between panels (≈ 0.025 m / 1 inch). Drawn as a gutter for intersection snaps.</span>
+              </div>
+              <div class="form-group">
+                <label>Camera FOV Calibration (\u00B0)</label>
+                <input type="number" id="inp-cam-fov" value="${state.system.cameraFovCalibration ?? ''}" min="80" max="130" step="0.5" placeholder="use INSP nominal">
+                <span class="hint">Fisheye half-angle from star calibration. Blank = use camera's INSP value.</span>
+              </div>
+            </div>
+            <div class="form-group" style="margin-top:14px">
+              <label>Deciduous Beam Transmittance by Month (%)</label>
+              <span class="hint" style="display:block;margin-bottom:6px">Bare-branch BEAM transmittance for deciduous-class masks. Leaf-on \u2248 4%, bare \u2248 45% (temperate maple, ~43\u00B0N). Diffuse uses these + the offset below.</span>
+              <div style="display:grid;grid-template-columns:repeat(12,1fr);gap:4px">
+                ${['J','F','M','A','M','J','J','A','S','O','N','D'].map((mo, i) => `
+                  <div style="text-align:center">
+                    <div style="font-size:9px;color:var(--text2);margin-bottom:2px">${mo}</div>
+                    <input type="number" id="inp-decid-tau-${i}" class="decid-tau" value="${Math.round((state.system.deciduousBeamTau?.[i] ?? 0) * 100)}" min="0" max="100" step="1" style="width:100%;padding:4px 2px;text-align:center;font-size:11px">
+                  </div>`).join('')}
+              </div>
+            </div>
+            <div class="form-grid" style="margin-top:10px">
+              <div class="form-group">
+                <label>Deciduous Diffuse Offset (%)</label>
+                <input type="number" id="inp-decid-diff-offset" value="${Math.round((state.system.deciduousDiffuseOffset ?? 0.15) * 100)}" min="0" max="50" step="1">
+                <span class="hint">Diffuse \u03C4 = beam \u03C4 + this. Bare branches admit more sky-diffuse than beam.</span>
+              </div>
             </div>
             <div style="margin-top:16px; display:flex; flex-wrap:wrap; gap:12px; align-items:center">
               <div style="padding:10px 14px; background:var(--surface2); border-radius:var(--radius-sm)">
@@ -215,6 +256,16 @@ function bindEvents() {
   // Geolocate button
   qs('#btn-geolocate', _container).addEventListener('click', geolocate);
 
+  // Weather CSV upload
+  const wfile = qs('#inp-weather-file', _container);
+  qs('#btn-weather-upload', _container)?.addEventListener('click', () => wfile?.click());
+  wfile?.addEventListener('change', handleWeatherUpload);
+  qs('#btn-weather-clear', _container)?.addEventListener('click', () => {
+    clearWeather();
+    renderWeatherStatus();
+  });
+  renderWeatherStatus();
+
   // Next button
   qs('#btn-next-array', _container).addEventListener('click', () => {
     document.querySelector('[data-view="array"]').click();
@@ -264,6 +315,14 @@ function saveAll() {
     'system.azimuth': parseFloat(g('inp-azimuth').value) || 180,
     'system.diodeSplit': g('inp-diode-split').value,
     'system.diodeSubsections': Math.max(1, parseInt(g('inp-diode-subs').value) || 2),
+    'system.panelGap': Math.max(0, Math.min(0.5, parseFloat(g('inp-panel-gap').value) || 0)),
+    'system.cameraFovCalibration': parseCamFov(g('inp-cam-fov').value),
+    'system.deciduousBeamTau': Array.from({ length: 12 }, (_, i) => {
+      const el = g(`inp-decid-tau-${i}`);
+      const v = el ? parseFloat(el.value) : NaN;
+      return Math.max(0, Math.min(1, (isNaN(v) ? 0 : v) / 100));
+    }),
+    'system.deciduousDiffuseOffset': Math.max(0, Math.min(0.5, (parseFloat(g('inp-decid-diff-offset').value) || 0) / 100)),
   });
 
   // Sync orientation buttons
@@ -455,9 +514,75 @@ function geolocate() {
   );
 }
 
+// ─── Weather CSV upload ─────────────────────────────
+
+function handleWeatherUpload(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  const status = qs('#weather-status', _container);
+  if (status) { status.textContent = 'Reading…'; status.style.color = 'var(--text2)'; }
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const parsed = parseWeatherCsv(String(reader.result), file.name);
+      setWeather(parsed);
+
+      // Auto-fill location from the file's metadata when the user hasn't set it.
+      const loc = getState().location;
+      const updates = {};
+      if (parsed.meta.lat != null && loc.lat == null) updates['location.lat'] = parsed.meta.lat;
+      if (parsed.meta.lon != null && loc.lon == null) updates['location.lon'] = parsed.meta.lon;
+      if (parsed.meta.elevation != null && loc.alt == null) updates['location.alt'] = parsed.meta.elevation;
+      if (Object.keys(updates).length) {
+        batchUpdate(updates);
+        const latI = qs('#inp-lat', _container); if (latI && updates['location.lat'] != null) latI.value = parsed.meta.lat;
+        const lonI = qs('#inp-lon', _container); if (lonI && updates['location.lon'] != null) lonI.value = parsed.meta.lon;
+        const altI = qs('#inp-alt', _container); if (altI && updates['location.alt'] != null) altI.value = Math.round(parsed.meta.elevation);
+      }
+      renderWeatherStatus();
+    } catch (err) {
+      if (status) { status.textContent = `Error: ${err.message}`; status.style.color = 'var(--loss)'; }
+    }
+  };
+  reader.onerror = () => {
+    if (status) { status.textContent = 'Could not read file.'; status.style.color = 'var(--loss)'; }
+  };
+  reader.readAsText(file);
+  e.target.value = ''; // allow re-uploading the same filename
+}
+
+function renderWeatherStatus() {
+  const status = qs('#weather-status', _container);
+  const clearBtn = qs('#btn-weather-clear', _container);
+  const w = getState().weather;
+  if (!status) return;
+  if (!w) {
+    status.textContent = 'No weather file loaded — using built-in clear-sky model.';
+    status.style.color = 'var(--text3)';
+    if (clearBtn) clearBtn.style.display = 'none';
+    return;
+  }
+  const where = [w.meta.city, w.meta.state].filter(Boolean).join(', ');
+  const coords = (w.meta.lat != null && w.meta.lon != null)
+    ? ` @ ${fmtLatLon(w.meta.lat, w.meta.lon)}` : '';
+  const rows = w.records ? `${w.count.toLocaleString()} rows` : 'metadata only (re-upload to model)';
+  status.textContent = `\u2713 ${w.filename || w.format}${where ? ' — ' + where : ''}${coords} \u2022 ${rows}`;
+  status.style.color = w.records ? 'var(--gain)' : 'var(--sun)';
+  if (clearBtn) clearBtn.style.display = '';
+}
+
 function parseNum(v) {
   const n = parseFloat(v);
   return isNaN(n) ? null : n;
+}
+
+// Camera FOV half-angle: blank -> null (fall back to INSP nominal), else clamp 80..130.
+function parseCamFov(v) {
+  if (v == null || String(v).trim() === '') return null;
+  const n = parseFloat(v);
+  if (isNaN(n)) return null;
+  return Math.max(80, Math.min(130, n));
 }
 
 function esc(s) {

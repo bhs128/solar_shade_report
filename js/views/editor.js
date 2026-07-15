@@ -1,19 +1,26 @@
 /**
  * SolarScope — Shade Editor View
  * Unified ground-mask painting for equirectangular and fisheye projections.
- * Features: brush-based mask painting, sun path overlay, horizon profile mini-chart.
+ * Features: brush-based mask painting, sun path overlay, horizon profile mini-chart,
+ * and live SVF (sky view factor) feedback from the current mask.
  */
 
 import {
-  getState, setState, addTrace, subscribe
+  getState, setState, addTrace, subscribe, getCoverageForPoints, getSubPanels, pointMeters
 } from '../state.js';
 import {
   el, qs, qsa, clearEl, imageToSky, skyToImage,
   buildFisheyeRotation, skyToFisheye, fisheyeToSky,
   sunPositionAtTime, maskLookupToHorizon, buildSkyMaskLookup,
-  decodeMaskDataUrl, debounce, normalizeFisheyeFov
+  decodeMaskDataUrl, debounce, resolveFisheyeFov,
+  MASK_OPEN, MASK_SOLID, MASK_DECIDUOUS
 } from '../utils.js';
-import { computeAllSunPaths, sunPosition, solarDeclination, MONTHS, MDAYS_CUM } from '../solar-engine.js';
+import {
+  computeAllSunPaths, sunPosition, solarDeclination, computeDiffuseSVF,
+  buildMergedCategoryLookupForPoints, deciduousTransmittanceByMonth,
+  computeDiffuseSVFComponents, clearSkyDNI, clearSkyDHI, clearSkyGHI, poaIrradiance,
+  MONTHS, MDAYS_CUM
+} from '../solar-engine.js';
 
 // ============================================================
 // Module state
@@ -22,6 +29,17 @@ import { computeAllSunPaths, sunPosition, solarDeclination, MONTHS, MDAYS_CUM } 
 let _container = null;
 let _photoId = null;
 let _traceName = null;
+
+// Panel Shade Simulator — whole-array beam-shade preview at a chosen date/time.
+// This state is module-level so it PERSISTS across photo switches / editor
+// rebuilds (the simulator reflects the whole array, not the edited photo).
+let _horizonCollapsed = false;
+let _simCollapsed = false;
+let _simDate = null;          // 'YYYY-MM-DD'
+let _simTime = 12;            // hours of day (0..24), local clock
+let _simPoints = null;        // per measurement point: { loc, catFn, svfOpen, svfDecid }
+let _simSubs = null;          // getSubPanels() metadata (row/col/sub/insideIds/mX/mY)
+let _simDataScn = null;       // scenario the cached point data was built for
 
 // Display canvas (photo + overlays)
 let _canvas = null;
@@ -37,8 +55,42 @@ let _isFisheye = false;
 let _worldToCamera = null;
 let _fov = 90;
 
+// Equirectangular panoramas are assumed to be NORTH-centred at their native
+// horizontal centre (column width/2 → azimuth 0°). The editor re-projects them
+// so the photo lines up with the heading-centred grid / analysis convention:
+// the canvas centre shows the `heading` direction (default 180° → SOUTH), which
+// keeps the relevant sky (sun path + southern obstructions) contiguous in the
+// middle instead of split across the wrap seam. Change this if a future source
+// uses a different native centre.
+const EQUIRECT_NATIVE_CENTER_AZ = 0;
+
+/**
+ * Draw the upper hemisphere of an equirectangular panorama, rolled horizontally
+ * so that the `heading` azimuth lands at the canvas centre (assuming the source
+ * image is EQUIRECT_NATIVE_CENTER_AZ-centred). Wrapping is handled by drawing the
+ * image in two segments. This is a pure horizontal translation, so left/right
+ * orientation is preserved and the drawn photo stays consistent with skyToImage.
+ */
+function drawEquirectTopHalf(ctx, img, W, H, heading) {
+  const natW = img.naturalWidth;
+  const srcH = img.naturalHeight / 2; // upper hemisphere only
+  // Native column fraction that should map to canvas x = 0.
+  let rollFrac = ((heading - EQUIRECT_NATIVE_CENTER_AZ) / 360) % 1;
+  if (rollFrac < 0) rollFrac += 1;
+  const srcStart = rollFrac * natW;
+  if (srcStart < 1) {
+    // No roll needed (heading ≈ native centre).
+    ctx.drawImage(img, 0, 0, natW, srcH, 0, 0, W, H);
+    return;
+  }
+  const firstSrcW = natW - srcStart;               // native [srcStart, natW)
+  const firstCanvasW = (firstSrcW / natW) * W;
+  ctx.drawImage(img, srcStart, 0, firstSrcW, srcH, 0, 0, firstCanvasW, H);
+  ctx.drawImage(img, 0, 0, srcStart, srcH, firstCanvasW, 0, W - firstCanvasW, H);
+}
+
 // Brush state
-let _brushTool = 'ground';   // 'ground' | 'sky'
+let _brushTool = 'ground';   // 'ground' | 'deciduous' | 'sky'
 let _brushSize = 30;
 let _isPainting = false;
 let _lastPaintPos = null;
@@ -57,6 +109,10 @@ let _hoveringSun = false;   // cursor is over the sun disc
 // Image cache to avoid reload flash when switching photos
 const _imgCache = new Map();
 let _isPhotoSwitch = false;
+
+// SVF sampling resolution for live feedback (higher = slower, smoother)
+const SVF_AZ_STEP = 2;
+const SVF_EL_STEP = 2;
 
 // ============================================================
 // Public API
@@ -154,8 +210,11 @@ function buildEditorUI() {
           <div class="card" style="padding:12px">
             <h2 style="margin-bottom:8px">Brush Tools</h2>
             <div style="display:flex;gap:4px;flex-wrap:wrap">
-              <button class="tool-btn ${_brushTool === 'ground' ? 'active' : ''}" data-tool="ground" title="Paint ground obstructions (G)">
-                &#9608; Ground
+              <button class="tool-btn ${_brushTool === 'ground' ? 'active' : ''}" data-tool="ground" title="Paint solid obstructions — blocks 100% year-round (G)">
+                &#9608; Solid
+              </button>
+              <button class="tool-btn ${_brushTool === 'deciduous' ? 'active' : ''}" data-tool="deciduous" title="Paint deciduous trees — bare in winter, full leaf in summer (D)" style="color:#6abf69">
+                &#9650; Deciduous
               </button>
               <button class="tool-btn ${_brushTool === 'sky' ? 'active' : ''}" data-tool="sky" title="Erase — mark as sky (S)">
                 &#9675; Sky
@@ -184,14 +243,7 @@ function buildEditorUI() {
             </div>
           </div>
 
-          <!-- Horizon profile mini-chart -->
-          <div class="card" style="padding:12px">
-            <h2 style="margin-bottom:8px">Derived Horizon Profile</h2>
-            <canvas id="c-horizon-mini" width="260" height="80" style="width:100%"></canvas>
-            <p class="hint" style="margin-top:4px">
-              Blue line = obstruction elevation derived from mask.
-            </p>
-          </div>
+
         </div>
 
         <!-- MAIN CANVAS -->
@@ -203,8 +255,79 @@ function buildEditorUI() {
             Paint obstructions (ground) on the photo. Switch between Ground (G) and Sky/Erase (S) tools.
             Use scroll wheel or [ / ] to adjust brush size. Sun paths: yellow = clear, red = blocked.
           </p>
+
+          <!-- Derived Horizon Profile card (collapsible) -->
+          <div class="card" style="margin-top:12px;padding:0;overflow:hidden">
+            <div class="collapse-head" data-collapse="horizon" style="display:flex;justify-content:space-between;align-items:center;padding:12px;cursor:pointer;user-select:none">
+              <h2 style="margin:0">Derived Horizon Profile</h2>
+              <span class="collapse-caret" style="color:var(--text3);font-size:12px">${_horizonCollapsed ? '&#9656;' : '&#9662;'}</span>
+            </div>
+            <div class="collapse-body" data-body="horizon" style="padding:0 12px 12px;${_horizonCollapsed ? 'display:none' : ''}">
+              <canvas id="c-horizon-mini" width="600" height="120" style="width:100%"></canvas>
+              <p class="hint" style="margin-top:4px">
+                Blue line = obstruction elevation derived from mask.
+              </p>
+              <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border)">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:11px">
+                  <div>
+                    <div style="display:flex;justify-content:space-between;gap:8px;margin-bottom:4px">
+                      <span style="color:var(--text2)">SVF (diffuse open)</span>
+                      <strong id="svf-open" style="font-family:'JetBrains Mono',monospace;color:var(--gain)">--</strong>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;gap:8px">
+                      <span style="color:var(--text2)">Diffuse loss</span>
+                      <strong id="svf-loss" style="font-family:'JetBrains Mono',monospace;color:var(--loss)">--</strong>
+                    </div>
+                  </div>
+                  <button class="btn btn-sm" id="btn-download-hor" title="Export horizon profile as CSV">Download HOR</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Panel Shade Simulator card (collapsible) -->
+          <div class="card" style="margin-top:12px;padding:0;overflow:hidden">
+            <div class="collapse-head" data-collapse="sim" style="display:flex;justify-content:space-between;align-items:center;padding:12px;cursor:pointer;user-select:none">
+              <h2 style="margin:0">Panel Shade Simulator</h2>
+              <span class="collapse-caret" style="color:var(--text3);font-size:12px">${_simCollapsed ? '&#9656;' : '&#9662;'}</span>
+            </div>
+            <div class="collapse-body" data-body="sim" style="padding:0 12px 12px;${_simCollapsed ? 'display:none' : ''}">
+              <p class="hint" style="margin-top:0;margin-bottom:8px">
+                Beam shade cast by all painted masks across the whole array at the chosen date &amp; time.
+                Use it to spot-check your masks against a real photo taken at a known moment.
+              </p>
+              <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:8px">
+                <label style="font-size:11px;color:var(--text2);display:flex;flex-direction:column;gap:2px">
+                  Date
+                  <input type="date" id="sim-date" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-sm);padding:4px 6px;font-size:12px">
+                </label>
+                <div style="flex:1;min-width:180px">
+                  <label style="font-size:11px;color:var(--text2);display:flex;justify-content:space-between">
+                    <span>Time of day</span>
+                    <strong id="sim-time-lbl" style="font-family:'JetBrains Mono',monospace;color:var(--sun)">--:--</strong>
+                  </label>
+                  <input type="range" id="sim-time" min="0" max="24" step="0.083333" value="${_simTime}" style="width:100%">
+                </div>
+              </div>
+              <div id="sim-sun-readout" style="font-size:11px;color:var(--sun);font-family:'JetBrains Mono',monospace;margin-bottom:6px">&#9788; Sun: --</div>
+              <canvas id="sim-panel-map" style="width:100%;border-radius:4px"></canvas>
+              <div class="hint" style="margin-top:6px;font-size:9px;display:flex;align-items:center;gap:6px">
+                <span>0</span>
+                <span style="flex:1;height:8px;border-radius:2px;background:linear-gradient(90deg,rgb(30,36,50),rgb(140,60,50),rgb(224,138,46),rgb(255,214,74))"></span>
+                <span>full sun</span>
+                <span style="margin-left:4px;color:var(--text2)">W/m&sup2; plane-of-array</span>
+              </div>
+              <p class="hint" style="margin-top:6px;font-size:9px">
+                Each cell = clear-sky POA irradiance reaching that sub-panel now, after distance-weighted
+                shade from the nearest painted masks (points inside a sub-panel are used directly; otherwise
+                inverse-distance interpolation). This is irradiance, not power &mdash; a partly-shaded string
+                loses more than its lit fraction due to cell mismatch (future refinement).
+              </p>
+            </div>
+          </div>
         </div>
       </div>
+
 
       <div style="text-align:center;margin-top:12px">
         <button class="btn btn-primary" id="btn-next-report" style="padding:10px 32px;font-size:14px">
@@ -221,6 +344,7 @@ function buildEditorUI() {
   prefillFisheyeCorners();
   drawMiniPanelMap();
   redraw();
+  renderSimulator();
   _isPhotoSwitch = false;
 }
 
@@ -236,7 +360,7 @@ function buildFisheyeOrientationUI(photo) {
   const panelAz = ori.panelAzimuth ?? sys.azimuth;
   const panelTilt = ori.panelTilt ?? sys.tilt;
   const clockAngle = ori.clockAngle ?? fe.accelClockAngle ?? 0;
-  const currentFov = ori.fov ?? normalizeFisheyeFov(fe.fov);
+  const currentFov = resolveFisheyeFov(photo, sys);
   const rawFov = fe.fov != null ? fe.fov.toFixed(1) : '—';
 
   // Build reference rows info
@@ -309,21 +433,33 @@ function buildFisheyeOrientationUI(photo) {
 
 function buildEquirectOrientationUI(photo) {
   const heading = photo.metadata?.compassHeading;
-  if (heading != null) {
+  const source = photo.metadata?.headingSource;
+
+  // Heading from photo metadata (EXIF/auto) — trusted, shown read-only.
+  if (heading != null && source !== 'manual') {
     return `
       <div class="card" style="padding:12px">
         <div style="font-size:11px;color:var(--gain)">
-          &#9737; Heading: ${heading.toFixed(1)}° (${photo.metadata.headingSource?.split('(')[0] || 'auto'})
+          &#9737; Heading: ${heading.toFixed(1)}° (${source?.split('(')[0] || 'auto'})
         </div>
       </div>
     `;
   }
+
+  // No metadata heading, or a user-entered manual value — keep it editable so
+  // it can be corrected. The value is persisted to state on change and used by
+  // the production engine.
+  const val = heading != null ? heading.toFixed(1) : '180';
+  const note = source === 'manual'
+    ? '&#9737; Manual heading (used in analysis). 180 = South.'
+    : '&#9888; No heading in metadata. Enter manually (180=South).';
+  const noteColor = source === 'manual' ? 'var(--gain)' : 'var(--warning)';
   return `
     <div class="card" style="padding:12px">
       <label style="font-size:10px;color:var(--text2);display:block;margin-bottom:3px">Compass Heading (°)</label>
-      <input type="number" id="inp-manual-heading" value="180" min="0" max="360" step="0.5"
+      <input type="number" id="inp-manual-heading" value="${val}" min="0" max="360" step="0.5"
         style="width:100%;background:var(--surface2);color:var(--warning);border:1px solid var(--border);border-radius:var(--radius-sm);padding:4px 8px;font-family:'JetBrains Mono',monospace;font-size:12px">
-      <span class="hint" style="color:var(--warning)">&#9888; No heading in metadata. Enter manually (180=South).</span>
+      <span class="hint" style="color:${noteColor}">${note}</span>
     </div>
   `;
 }
@@ -358,6 +494,9 @@ function drawMiniPanelMap() {
 
   const photo = state.photos[_photoId];
   const currentPtIds = new Set(photo?.coveragePoints || []);
+  // Every panel/sub-panel that USES one of this photo's points (junction points
+  // are used by all adjacent panels, not just their owner).
+  const coverage = getCoverageForPoints([...currentPtIds]);
 
   const dpr = window.devicePixelRatio || 1;
   const displayW = cvs.clientWidth || 240;
@@ -383,7 +522,7 @@ function drawMiniPanelMap() {
       const y = pad + r * (ph + gap);
 
       const pts = Object.values(state.points).filter(p => p.panelRow === r && p.panelCol === c);
-      const hasCurrent = pts.some(p => currentPtIds.has(p.id));
+      const hasCurrent = coverage.panelKeys.has(`${r},${c}`);
       const hasAnyPhoto = pts.some(p => p.photoId);
       const hasTrace = pts.some(p => {
         const ph2 = state.photos[p.photoId];
@@ -436,6 +575,344 @@ function drawMiniPanelMap() {
 }
 
 // ============================================================
+// Panel Shade Simulator
+// ============================================================
+
+/** Default the date/time picker from the current photo's capture time, once. */
+function initSimDefaults() {
+  if (_simDate) return;
+  const photo = getState().photos[_photoId];
+  let dt = null;
+  if (photo?.metadata?.datetime) {
+    const d = new Date(photo.metadata.datetime);
+    if (!isNaN(d.getTime())) dt = d;
+  }
+  if (!dt) dt = new Date();
+  const y = dt.getFullYear();
+  const mo = String(dt.getMonth() + 1).padStart(2, '0');
+  const da = String(dt.getDate()).padStart(2, '0');
+  _simDate = `${y}-${mo}-${da}`;
+  _simTime = dt.getHours() + dt.getMinutes() / 60;
+}
+
+/** Prepare DOM, bind controls, ensure lookups, and draw the simulator. */
+function renderSimulator() {
+  initSimDefaults();
+  const dateInp = qs('#sim-date', _container);
+  const timeInp = qs('#sim-time', _container);
+  if (dateInp) dateInp.value = _simDate;
+  if (timeInp) timeInp.value = _simTime;
+  updateSimTimeLabel();
+  // Reuse cached point data across photo switches; only build if missing/stale.
+  if (!_simPoints || _simDataScn !== getState().activeScenario) {
+    ensureSimData().then(drawSimMap);
+  } else {
+    drawSimMap();
+  }
+}
+
+/**
+ * (Re)build the per-measurement-point shade data for the whole array (async).
+ *
+ * For every point that has a painted mask (in the active scenario) we cache:
+ *   - loc: physical position in metres (for distance weighting)
+ *   - catFn: (az,el) => 0|1|2 obstruction category at that point
+ *   - svfOpen / svfDecid: that point's diffuse sky-view-factor components
+ * The expensive hemispheric SVF integral is done ONCE here; the per-instant
+ * beam test (catFn at the sun direction) is cheap and runs at draw time.
+ */
+async function ensureSimData() {
+  const state = getState();
+  const scn = state.activeScenario;
+  const tilt = state.system.tilt;
+  const subs = getSubPanels();
+
+  const points = [];
+  for (const pt of Object.values(state.points)) {
+    const photo = state.photos[pt.photoId];
+    if (!photo) continue;
+    const tr = photo.traces[scn] || photo.traces['As-Is'];
+    if (!tr?.groundMask) continue;
+    const catFn = await buildMergedCategoryLookupForPoints([pt.id], scn);
+    // Panel facing for this point: per-photo calibration if present, else system.
+    const panelAz = photo.orientation?.panelAzimuth ?? state.system.azimuth;
+    const svf = computeDiffuseSVFComponents(catFn, tilt, panelAz);
+    points.push({ id: pt.id, loc: pointMeters(pt), catFn, svfOpen: svf.open, svfDecid: svf.decid });
+  }
+
+  _simPoints = points;
+  _simSubs = subs;
+  _simDataScn = scn;
+}
+
+/** Debounced rebuild so mask edits flow into the simulator without thrashing. */
+const scheduleSimRefresh = debounce(() => {
+  ensureSimData().then(drawSimMap);
+}, 400);
+
+/** Sun position for the picked date/time, or null if unavailable/below horizon-safe. */
+function computeSimSun() {
+  const state = getState();
+  const { lat, lon } = state.location;
+  if (lat == null || lon == null || !_simDate) return null;
+  const [y, mo, d] = _simDate.split('-').map(Number);
+  const total = Math.round(_simTime * 60);
+  const hh = Math.floor(total / 60);
+  const mm = total % 60;
+  const dt = new Date(y, (mo || 1) - 1, d || 1, hh, mm, 0);
+  return sunPositionAtTime(dt, lat, lon);
+}
+
+function simMonthIndex() {
+  if (!_simDate) return new Date().getMonth();
+  const mo = Number(_simDate.split('-')[1]);
+  return Math.max(0, Math.min(11, (mo || 1) - 1));
+}
+
+function updateSimTimeLabel() {
+  const lbl = qs('#sim-time-lbl', _container);
+  if (!lbl) return;
+  // Round to whole minutes and carry 60→0 so a value like 18.9999 reads 19:00.
+  const total = Math.round(_simTime * 60);
+  const hh = Math.floor(total / 60);
+  const mm = total % 60;
+  lbl.textContent = `${String(hh % 24).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+}
+
+function updateSimReadout(sun, poaFull) {
+  const out = qs('#sim-sun-readout', _container);
+  if (!out) return;
+  const state = getState();
+  if (state.location.lat == null || state.location.lon == null) {
+    out.innerHTML = '&#9888; Set project latitude/longitude to simulate sun position.';
+    out.style.color = 'var(--text3)';
+    return;
+  }
+  if (!sun || sun.elevation <= 0) {
+    out.innerHTML = '&#127769; Sun below horizon (night)';
+    out.style.color = 'var(--text3)';
+    return;
+  }
+  const full = poaFull && poaFull.total > 1
+    ? ` &nbsp;&middot;&nbsp; Full POA &asymp; ${Math.round(poaFull.total)} W/m&sup2;` : '';
+  out.innerHTML = `&#9788; Sun: Az ${sun.azimuth.toFixed(1)}&deg; &nbsp; El ${sun.elevation.toFixed(1)}&deg;${full}`;
+  out.style.color = 'var(--sun)';
+}
+
+/**
+ * Distance-weighted shade for one sub-panel from the cached point data.
+ *
+ * Tiered rule (matches the physical intuition):
+ *   1. If measurement points fall INSIDE this sub-panel, average only those
+ *      (exact local data — no interpolation, no blending with distant points).
+ *   2. Otherwise inverse-distance-squared weight ALL masked points, so the
+ *      nearest dominate and far competing data fades out — without averaging
+ *      away accurate nearby information.
+ * Returns null when no mask data exists anywhere.
+ */
+function interpolateSubShade(sp, sun, tauBeam) {
+  if (!_simPoints || _simPoints.length === 0) return null;
+
+  const beamClearOf = (p) => {
+    const c = p.catFn(sun.azimuth, sun.elevation);
+    return c === MASK_SOLID ? 0 : c === MASK_DECIDUOUS ? tauBeam : 1;
+  };
+
+  const insideSet = new Set(sp.insideIds || []);
+  const inside = _simPoints.filter((p) => insideSet.has(p.id));
+  const pool = inside.length ? inside : _simPoints;
+  const equalWeight = inside.length > 0;
+
+  let wSum = 0, beam = 0, so = 0, sd = 0;
+  for (const p of pool) {
+    let w;
+    if (equalWeight) {
+      w = 1;
+    } else {
+      const dx = p.loc.x - sp.mX, dy = p.loc.y - sp.mY;
+      w = 1 / (dx * dx + dy * dy + 1e-6); // 1/d² — near-zero distance dominates
+    }
+    wSum += w;
+    beam += w * beamClearOf(p);
+    so += w * p.svfOpen;
+    sd += w * p.svfDecid;
+  }
+  if (wSum <= 0) return null;
+  return { beamClear: beam / wSum, svfOpen: so / wSum, svfDecid: sd / wSum, exact: equalWeight };
+}
+
+/** Colour ramp: 0 (deep shade) → red → orange → gold (full irradiance). */
+function poaColor(frac) {
+  const f = Math.max(0, Math.min(1, frac));
+  const stops = [
+    [0.0, [30, 36, 50]],
+    [0.35, [140, 60, 50]],
+    [0.7, [224, 138, 46]],
+    [1.0, [255, 214, 74]],
+  ];
+  let a = stops[0], b = stops[stops.length - 1];
+  for (let i = 0; i < stops.length - 1; i++) {
+    if (f >= stops[i][0] && f <= stops[i + 1][0]) { a = stops[i]; b = stops[i + 1]; break; }
+  }
+  const t = b[0] > a[0] ? (f - a[0]) / (b[0] - a[0]) : 0;
+  const ch = (k) => Math.round(a[1][k] + (b[1][k] - a[1][k]) * t);
+  return `rgb(${ch(0)},${ch(1)},${ch(2)})`;
+}
+
+/** Draw the whole-array plane-of-array irradiance map at the simulated instant. */
+function drawSimMap() {
+  const canvas = qs('#sim-panel-map', _container);
+  if (!canvas) return;
+  const state = getState();
+  const { rows, cols, diodeSplit, panelWidth, panelHeight, panelGap = 0, diodeSubsections } = state.system;
+  const nSubs = diodeSubsections || 2;
+  if (!rows || !cols) return;
+
+  const sun = computeSimSun();
+  const night = !sun || sun.elevation <= 0;
+
+  // Clear-sky plane-of-array irradiance (unshaded) at this instant — the
+  // "full sun" reference each sub-panel is scaled down from.
+  const lat = state.location.lat ?? 45;
+  const tilt = state.system.tilt || 0;
+  const sysAz = state.system.azimuth ?? 180;
+  const tauMonth = deciduousTransmittanceByMonth(state.system, lat);
+  const tauBeam = tauMonth.beam[simMonthIndex()];
+  const tauDiffuse = tauMonth.diffuse[simMonthIndex()];
+
+  let poaFull = null;
+  if (!night) {
+    const dni = clearSkyDNI(sun.elevation);
+    const dhi = clearSkyDHI(sun.elevation, dni);
+    const ghi = clearSkyGHI(sun.elevation, dni, dhi);
+    poaFull = poaIrradiance(dni, dhi, ghi, sun.elevation, sun.azimuth, tilt, sysAz);
+  }
+  updateSimReadout(sun, poaFull);
+  const refPOA = poaFull && poaFull.total > 1 ? poaFull.total : 1000;
+
+  // Layout (mirrors report drawArrayMap for familiarity).
+  const dpr = window.devicePixelRatio || 1;
+  const wrapW = canvas.clientWidth || 300;
+  const PAD = 10;
+  const aspect = (panelHeight || 1) / (panelWidth || 1);
+  const gapFrac = panelWidth > 0 ? panelGap / panelWidth : 0.02;
+  let pW = (wrapW - 2 * PAD) / (cols + (cols - 1) * gapFrac);
+  let pH = pW * aspect;
+  let gap = pW * gapFrac;
+  const maxH = 300;
+  let gridH = rows * pH + (rows - 1) * gap;
+  if (gridH > maxH) { const sc = maxH / gridH; pW *= sc; pH *= sc; gap *= sc; }
+  const totalW = cols * pW + (cols - 1) * gap;
+  const totalH = rows * pH + (rows - 1) * gap;
+  const ox = (wrapW - totalW) / 2;
+  const oy = PAD;
+  const canvasH = totalH + 2 * PAD;
+
+  canvas.width = Math.round(wrapW * dpr);
+  canvas.height = Math.round(canvasH * dpr);
+  canvas.style.height = canvasH + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, wrapW, canvasH);
+
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const px = ox + c * (pW + gap);
+      const py = oy + r * (pH + gap);
+      const panelIdx = r * cols + c;
+
+      for (let s = 0; s < nSubs; s++) {
+        const idx = panelIdx * nSubs + s;
+        const sp = _simSubs ? _simSubs[idx] : null;
+
+        let color = '#2a2f38', label = '', frac = 0;
+        if (night) {
+          color = '#1a2332';
+        } else {
+          const sh = sp ? interpolateSubShade(sp, sun, tauBeam) : null;
+          if (!sh) {
+            color = '#2a2f38';                    // no mask data anywhere
+          } else {
+            const svfEff = sh.svfOpen + sh.svfDecid * tauDiffuse;
+            const poaSub = sh.beamClear * poaFull.beam + svfEff * poaFull.diffuse + poaFull.ground;
+            frac = refPOA > 0 ? poaSub / refPOA : 0;
+            color = poaColor(frac);
+            label = `${Math.round(poaSub)}`;
+          }
+        }
+
+        let sx, sy, sw, sh2;
+        if (diodeSplit === 'vertical') { sw = pW / nSubs; sh2 = pH; sx = px + s * sw; sy = py; }
+        else { sw = pW; sh2 = pH / nSubs; sx = px; sy = py + s * sh2; }
+
+        ctx.fillStyle = color;
+        ctx.fillRect(sx, sy, sw - 0.5, sh2 - 0.5);
+
+        if (label && sw > 26 && sh2 > 12) {
+          ctx.fillStyle = frac > 0.45 ? 'rgba(0,0,0,0.72)' : 'rgba(255,255,255,0.85)';
+          ctx.font = 'bold 8px "JetBrains Mono", monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(label, sx + sw / 2, sy + sh2 / 2);
+        }
+      }
+
+      ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(px, py, pW, pH);
+      if (pW > 20 && pH > 12) {
+        ctx.fillStyle = 'rgba(255,255,255,0.5)';
+        ctx.font = 'bold 8px "JetBrains Mono", monospace';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+        ctx.fillText(`${String.fromCharCode(65 + r)}${c + 1}`, px + 2, py + 2);
+      }
+    }
+  }
+}
+
+/** Draw an X on the photo canvas at the simulator's sun position. */
+function drawSimSunMarker(W, H) {
+  if (_simCollapsed || !_ctx) return;
+  const sun = computeSimSun();
+  if (!sun || sun.elevation <= 0) return;
+  const c = skyToCanvas(sun.azimuth, sun.elevation);
+  if (!c || c.visible === false) return;
+  if (c.x < 0 || c.x > W || c.y < 0 || c.y > H) return;
+
+  const s = 9;
+  _ctx.save();
+  // Soft halo for visibility over any background.
+  _ctx.beginPath();
+  _ctx.arc(c.x, c.y, s + 5, 0, Math.PI * 2);
+  _ctx.fillStyle = 'rgba(255, 210, 60, 0.18)';
+  _ctx.fill();
+  // Dark contrast outline, then the gold X.
+  _ctx.lineCap = 'round';
+  _ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+  _ctx.lineWidth = 4.5;
+  _ctx.beginPath();
+  _ctx.moveTo(c.x - s, c.y - s); _ctx.lineTo(c.x + s, c.y + s);
+  _ctx.moveTo(c.x + s, c.y - s); _ctx.lineTo(c.x - s, c.y + s);
+  _ctx.stroke();
+  _ctx.strokeStyle = '#ffd23c';
+  _ctx.lineWidth = 2.5;
+  _ctx.beginPath();
+  _ctx.moveTo(c.x - s, c.y - s); _ctx.lineTo(c.x + s, c.y + s);
+  _ctx.moveTo(c.x + s, c.y - s); _ctx.lineTo(c.x - s, c.y + s);
+  _ctx.stroke();
+  // Label.
+  _ctx.fillStyle = '#ffd23c';
+  _ctx.font = 'bold 9px "JetBrains Mono", monospace';
+  _ctx.textAlign = 'center';
+  _ctx.lineWidth = 3;
+  _ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+  _ctx.strokeText('sim sun', c.x, c.y - s - 6);
+  _ctx.fillText('sim sun', c.x, c.y - s - 6);
+  _ctx.restore();
+}
+
+// ============================================================
 // Canvas setup
 // ============================================================
 
@@ -456,7 +933,7 @@ function setupCanvas(photo) {
   if (_isFisheye && photo.fisheye) {
     const ori = photo.orientation || {};
     const sys = getState().system;
-    _fov = ori.fov ?? normalizeFisheyeFov(photo.fisheye.fov);
+    _fov = resolveFisheyeFov(photo, sys);
     _worldToCamera = buildFisheyeRotation(
       ori.panelAzimuth ?? sys.azimuth,
       ori.panelTilt ?? sys.tilt,
@@ -497,9 +974,29 @@ function loadMaskFromState() {
     _maskCtx.clearRect(0, 0, _maskCanvas.width, _maskCanvas.height);
     _maskCtx.drawImage(img, 0, 0, _maskCanvas.width, _maskCanvas.height);
     prefillFisheyeCorners();
+    // Derive the horizon profile immediately so the mini-chart + SVF reflect the
+    // loaded mask without waiting for the first edit.
+    refreshHorizonFromCanvas();
     redraw();
   };
   img.src = trace.groundMask;
+}
+
+/**
+ * Derive the 1D horizon profile from whatever is currently on the mask canvas
+ * (including fisheye corner prefill) and update the trace + mini-chart.
+ */
+function refreshHorizonFromCanvas() {
+  const photo = getState().photos[_photoId];
+  const trace = photo?.traces[_traceName];
+  if (!trace || !_maskCtx || !_maskCanvas) return;
+  const sys = getState().system;
+  const maskData = _maskCtx.getImageData(0, 0, _maskCanvas.width, _maskCanvas.height);
+  const lookup = buildSkyMaskLookup(photo, maskData, {
+    azimuth: sys.azimuth, tilt: sys.tilt, cameraFovCalibration: sys.cameraFovCalibration,
+  });
+  trace.horizonProfile = maskLookupToHorizon(lookup);
+  updateHorizonMini();
 }
 
 /**
@@ -536,6 +1033,8 @@ function saveMaskToState() {
   trace.groundMask = hasContent ? _maskCanvas.toDataURL('image/png') : null;
   // Also derive legacy horizon for backwards compat
   updateHorizonFromMask(trace);
+  // Flow the edit into the whole-array shade simulator.
+  scheduleSimRefresh();
 }
 
 const debouncedSave = debounce(saveMaskToState, 500);
@@ -549,7 +1048,7 @@ function updateHorizonFromMask(trace) {
   const photo = getState().photos[_photoId];
   const sys = getState().system;
   decodeMaskDataUrl(trace.groundMask).then(maskData => {
-    const lookup = buildSkyMaskLookup(photo, maskData, { azimuth: sys.azimuth, tilt: sys.tilt });
+    const lookup = buildSkyMaskLookup(photo, maskData, { azimuth: sys.azimuth, tilt: sys.tilt, cameraFovCalibration: sys.cameraFovCalibration });
     trace.horizonProfile = maskLookupToHorizon(lookup);
     updateHorizonMini();
   });
@@ -587,8 +1086,7 @@ function getOrientation() {
 function rebuildFisheyeTransform() {
   const o = getOrientation();
   const photo = getState().photos[_photoId];
-  const ori = photo?.orientation || {};
-  _fov = ori.fov ?? normalizeFisheyeFov(photo?.fisheye?.fov);
+  _fov = resolveFisheyeFov(photo, getState().system);
   _worldToCamera = buildFisheyeRotation(o.panelAz, o.panelTilt, o.clockAngle);
 }
 
@@ -636,7 +1134,7 @@ function getImagePixels() {
   if (_isFisheye) {
     tctx.drawImage(_img, 0, 0, W, H);
   } else {
-    tctx.drawImage(_img, 0, 0, _img.naturalWidth, _img.naturalHeight / 2, 0, 0, W, H);
+    drawEquirectTopHalf(tctx, _img, W, H, getHeading());
   }
   try {
     return tctx.getImageData(0, 0, W, H);
@@ -791,8 +1289,8 @@ function redraw() {
     if (_isFisheye) {
       _ctx.drawImage(_img, 0, 0, W, H);
     } else {
-      // Upper hemisphere only
-      _ctx.drawImage(_img, 0, 0, _img.naturalWidth, _img.naturalHeight / 2, 0, 0, W, H);
+      // Upper hemisphere only, rolled so SOUTH (heading) is centred.
+      drawEquirectTopHalf(_ctx, _img, W, H, getHeading());
     }
   } else {
     _ctx.fillStyle = '#1a2030';
@@ -827,10 +1325,16 @@ function redraw() {
     drawSunPaths(W, H);
   }
 
+  // Simulated-sun marker — where the Panel Shade Simulator places the sun for
+  // the chosen date/time (independent of the sun-path overlay toggle).
+  drawSimSunMarker(W, H);
+
   // Brush cursor
   if (_lastPaintPos) {
     _ctx.save();
-    _ctx.strokeStyle = _brushTool === 'ground' ? 'rgba(230,80,80,0.7)' : 'rgba(80,180,230,0.7)';
+    _ctx.strokeStyle = _brushTool === 'ground' ? 'rgba(230,80,80,0.7)'
+      : _brushTool === 'deciduous' ? 'rgba(80,200,80,0.8)'
+      : 'rgba(80,180,230,0.7)';
     _ctx.lineWidth = 1.5;
     _ctx.beginPath();
     _ctx.arc(_lastPaintPos.x, _lastPaintPos.y, _brushSize / 2, 0, Math.PI * 2);
@@ -875,6 +1379,100 @@ function redraw() {
   updateSunErrorDisplay();
 
   updateHorizonMini();
+  scheduleSvfUpdate();
+}
+
+function computeCurrentSVF() {
+  if (!_maskCtx || !_maskCanvas) return null;
+  const photo = getState().photos[_photoId];
+  if (!photo) return null;
+
+  const maskData = _maskCtx.getImageData(0, 0, _maskCanvas.width, _maskCanvas.height);
+  const sys = getState().system;
+  const lookup = buildSkyMaskLookup(photo, maskData, { azimuth: sys.azimuth, tilt: sys.tilt, cameraFovCalibration: sys.cameraFovCalibration });
+
+  // Panel-normal-weighted diffuse SVF, identical to the production engine.
+  // (Insta360 photos are captured with image zenith == panel normal.)
+  // Tilt is trusted from the system config; the facing azimuth uses this
+  // photo's orientation calibration when available.
+  const svfAz = photo.orientation?.panelAzimuth ?? sys.azimuth;
+  const svf = computeDiffuseSVF(lookup, sys.tilt, svfAz, {
+    azStep: SVF_AZ_STEP,
+    elStep: SVF_EL_STEP,
+  });
+
+  return {
+    svf,
+    diffuseLoss: 1 - svf,
+  };
+}
+
+function updateSVFReadout() {
+  const openEl = qs('#svf-open', _container);
+  const lossEl = qs('#svf-loss', _container);
+  if (!openEl || !lossEl) return;
+
+  const stats = computeCurrentSVF();
+  if (!stats) {
+    openEl.textContent = '--';
+    lossEl.textContent = '--';
+    return;
+  }
+
+  openEl.textContent = `${(stats.svf * 100).toFixed(1)}%`;
+  lossEl.textContent = `${(stats.diffuseLoss * 100).toFixed(1)}%`;
+}
+
+const scheduleSvfUpdate = debounce(updateSVFReadout, 160);
+
+/**
+ * Export horizon profile as HOR (CSV with Azimuth, Obstruction Elevation).
+ */
+function exportHorizonProfile() {
+  const state = getState();
+  const photo = state.photos[_photoId];
+  if (!photo || !_traceName) return;
+
+  const trace = photo.traces[_traceName];
+  if (!trace || !trace.horizonProfile) {
+    alert('No horizon profile available for this scenario.');
+    return;
+  }
+
+  const profile = trace.horizonProfile;
+  const profileEl = (az) => {
+    if (Array.isArray(profile) || ArrayBuffer.isView(profile)) {
+      return Number(profile[az] || 0);
+    }
+    return Number(profile[az] ?? profile[String(az)] ?? 0);
+  };
+  let csv = 'Azimuth (deg),Obstruction Elevation (deg)\n';
+  
+  for (let az = 0; az < 360; az++) {
+    const el = profileEl(az);
+    csv += `${az},${el.toFixed(1)}\n`;
+  }
+
+  const photoName = photo.filename.replace(/\.[^.]+$/, '');
+  const traceName = _traceName.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+  const filename = `${state.projectName || 'shade'}_horizon_${photoName}_${traceName}.csv`;
+  
+  downloadText(filename, csv);
+}
+
+/**
+ * Trigger a browser download of text data.
+ */
+function downloadText(filename, text, mime = 'text/csv') {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 /**
@@ -902,8 +1500,8 @@ function drawGrid(W, H) {
     for (let el = 0; el <= 80; el += 10) {
       const isHorizon = el === 0;
       _ctx.beginPath();
-      _ctx.strokeStyle = isHorizon ? 'rgba(255,200,0,0.4)' : 'rgba(255,255,255,0.35)';
-      _ctx.lineWidth = isHorizon ? 2 : 1;
+      _ctx.strokeStyle = isHorizon ? 'rgba(255,200,0,0.6)' : 'rgba(255,255,255,0.5)';
+      _ctx.lineWidth = isHorizon ? 2.5 : 1;
       let started = false;
       for (let az = 0; az < 360; az += 2) {
         const p = skyToCanvas(az, el);
@@ -942,14 +1540,14 @@ function drawGrid(W, H) {
         _ctx.beginPath();
         _ctx.moveTo(p0.x, p0.y);
         _ctx.lineTo(p1.x, p1.y);
-        _ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+        _ctx.strokeStyle = 'rgba(255,255,255,0.5)';
         _ctx.lineWidth = 1;
         _ctx.stroke();
       }
       const label = cardinals[az] || `${az}°`;
       const lp = skyToCanvas(az, 2);
       if (lp.visible) {
-        _ctx.fillStyle = cardinals[az] ? 'rgba(255,255,255,0.7)' : 'rgba(255,255,255,0.4)';
+        _ctx.fillStyle = cardinals[az] ? 'rgba(255,255,255,0.85)' : 'rgba(255,255,255,0.55)';
         _ctx.textAlign = 'center';
         _ctx.fillText(label, lp.x, lp.y + 12);
       }
@@ -957,8 +1555,8 @@ function drawGrid(W, H) {
   } else {
     // Equirectangular grid (same as original)
     const heading = getHeading();
-    _ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-    _ctx.lineWidth = 0.5;
+    _ctx.strokeStyle = 'rgba(255,255,255,0.28)';
+    _ctx.lineWidth = 1;
 
     // Elevation lines
     for (let elev = 0; elev <= 90; elev += 10) {
@@ -968,7 +1566,7 @@ function drawGrid(W, H) {
       _ctx.moveTo(0, cp.y);
       _ctx.lineTo(W, cp.y);
       _ctx.stroke();
-      _ctx.fillStyle = 'rgba(255,255,255,0.3)';
+      _ctx.fillStyle = 'rgba(255,255,255,0.6)';
       _ctx.textAlign = 'left';
       _ctx.fillText(`${elev}°`, 4, cp.y - 2);
     }
@@ -979,11 +1577,11 @@ function drawGrid(W, H) {
       _ctx.beginPath();
       _ctx.moveTo(0, hp.y);
       _ctx.lineTo(W, hp.y);
-      _ctx.strokeStyle = 'rgba(255,200,0,0.4)';
-      _ctx.lineWidth = 2;
+      _ctx.strokeStyle = 'rgba(255,200,0,0.6)';
+      _ctx.lineWidth = 2.5;
       _ctx.stroke();
-      _ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-      _ctx.lineWidth = 0.5;
+      _ctx.strokeStyle = 'rgba(255,255,255,0.28)';
+      _ctx.lineWidth = 1;
     }
 
     // Azimuth lines
@@ -994,11 +1592,11 @@ function drawGrid(W, H) {
       _ctx.beginPath();
       _ctx.moveTo(cp.x, 0);
       _ctx.lineTo(cp.x, H);
-      _ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-      _ctx.lineWidth = 0.5;
+      _ctx.strokeStyle = 'rgba(255,255,255,0.28)';
+      _ctx.lineWidth = 1;
       _ctx.stroke();
       const label = cardinals[az] || `${az}°`;
-      _ctx.fillStyle = cardinals[az] ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.25)';
+      _ctx.fillStyle = cardinals[az] ? 'rgba(255,255,255,0.8)' : 'rgba(255,255,255,0.45)';
       _ctx.textAlign = 'center';
       _ctx.fillText(label, cp.x, H - 4);
     }
@@ -1169,7 +1767,17 @@ function updateHorizonMini() {
     return;
   }
 
-  const maxEl = Math.max(1, ...profile);
+  const getProfileEl = (az) => {
+    if (Array.isArray(profile) || ArrayBuffer.isView(profile)) {
+      return Number(profile[az] || 0);
+    }
+    return Number(profile[az] ?? profile[String(az)] ?? 0);
+  };
+
+  let maxEl = 1;
+  for (let az = 0; az < 360; az++) {
+    maxEl = Math.max(maxEl, getProfileEl(az));
+  }
   mc.fillStyle = '#3b82f618';
   mc.strokeStyle = '#3b82f6';
   mc.lineWidth = 1.5;
@@ -1177,7 +1785,7 @@ function updateHorizonMini() {
   mc.moveTo(0, H);
   for (let az = 0; az < 360; az++) {
     const x = (az / 360) * W;
-    const y = H - (profile[az] / maxEl) * (H - 10);
+    const y = H - (getProfileEl(az) / maxEl) * (H - 10);
     mc.lineTo(x, y);
   }
   mc.lineTo(W, H);
@@ -1186,7 +1794,7 @@ function updateHorizonMini() {
   mc.beginPath();
   for (let az = 0; az < 360; az++) {
     const x = (az / 360) * W;
-    const y = H - (profile[az] / maxEl) * (H - 10);
+    const y = H - (getProfileEl(az) / maxEl) * (H - 10);
     if (az === 0) mc.moveTo(x, y);
     else mc.lineTo(x, y);
   }
@@ -1207,8 +1815,10 @@ function updateHorizonMini() {
 
 function paintAt(cx, cy) {
   const r = _brushSize / 2;
-  if (_brushTool === 'ground') {
-    _maskCtx.fillStyle = 'rgba(230, 60, 60, 0.85)';
+  if (_brushTool === 'ground' || _brushTool === 'deciduous') {
+    _maskCtx.fillStyle = _brushTool === 'deciduous'
+      ? 'rgba(60, 180, 60, 0.85)'   // green = deciduous (seasonal)
+      : 'rgba(230, 60, 60, 0.85)';  // red = solid (year-round)
     _maskCtx.beginPath();
     _maskCtx.arc(cx, cy, r, 0, Math.PI * 2);
     _maskCtx.fill();
@@ -1325,7 +1935,18 @@ function bindEditorEvents() {
   });
 
   // Manual heading
-  qs('#inp-manual-heading', _container)?.addEventListener('change', () => redraw());
+  qs('#inp-manual-heading', _container)?.addEventListener('change', (e) => {
+    const photo = getState().photos[_photoId];
+    if (photo) {
+      const v = parseFloat(e.target.value);
+      if (!Number.isNaN(v)) {
+        if (!photo.metadata) photo.metadata = {};
+        photo.metadata.compassHeading = ((v % 360) + 360) % 360;
+        photo.metadata.headingSource = 'manual';
+      }
+    }
+    redraw();
+  });
 
   // Fisheye orientation sliders
   for (const id of ['rng-panel-az', 'rng-panel-tilt', 'rng-clock-angle', 'rng-fov']) {
@@ -1424,6 +2045,44 @@ function bindEditorEvents() {
 
   // Canvas paint events
   bindCanvasEvents();
+
+  // HOR download button
+  qs('#btn-download-hor', _container)?.addEventListener('click', () => {
+    exportHorizonProfile();
+  });
+
+  // Collapsible card headers (Horizon Profile + Panel Shade Simulator)
+  for (const head of qsa('.collapse-head', _container)) {
+    head.addEventListener('click', () => {
+      const key = head.dataset.collapse;
+      const collapsed = key === 'horizon' ? (_horizonCollapsed = !_horizonCollapsed)
+        : (_simCollapsed = !_simCollapsed);
+      const body = qs(`.collapse-body[data-body="${key}"]`, _container);
+      if (body) body.style.display = collapsed ? 'none' : '';
+      const caret = head.querySelector('.collapse-caret');
+      if (caret) caret.innerHTML = collapsed ? '&#9656;' : '&#9662;';
+      // Canvases sized to clientWidth need a redraw once revealed.
+      if (!collapsed) {
+        if (key === 'horizon') updateHorizonMini();
+        else drawSimMap();
+      }
+      // Show/hide the simulated-sun marker on the photo canvas.
+      if (key === 'sim') redraw();
+    });
+  }
+
+  // Panel Shade Simulator — date picker + time-of-day slider
+  qs('#sim-date', _container)?.addEventListener('change', (e) => {
+    if (e.target.value) _simDate = e.target.value;
+    drawSimMap();
+    redraw();
+  });
+  qs('#sim-time', _container)?.addEventListener('input', (e) => {
+    _simTime = parseFloat(e.target.value);
+    updateSimTimeLabel();
+    drawSimMap();
+    redraw();
+  });
 
   // Next button
   qs('#btn-next-report', _container)?.addEventListener('click', () => {
@@ -1594,6 +2253,11 @@ function onKeyDown(e) {
     _brushTool = 'ground';
     qsa('.tool-btn[data-tool]', _container).forEach(b =>
       b.classList.toggle('active', b.dataset.tool === 'ground')
+    );
+  } else if (e.key === 'd' || e.key === 'D') {
+    _brushTool = 'deciduous';
+    qsa('.tool-btn[data-tool]', _container).forEach(b =>
+      b.classList.toggle('active', b.dataset.tool === 'deciduous')
     );
   } else if (e.key === 's' || e.key === 'S') {
     _brushTool = 'sky';
